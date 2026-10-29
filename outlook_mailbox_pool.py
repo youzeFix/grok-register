@@ -27,10 +27,24 @@ _HEALTH_MAX_WORKERS = 4
 
 
 def _split_by_dashes(line: str) -> list[str]:
+    """Split a pool line on runs of 4+ dashes.
+
+    A run of exactly 4 dashes is one separator. A longer run encodes that
+    many separators, so 8 dashes means "one empty field in between" -- that is
+    what an empty password column produces. Any remainder that is not a
+    multiple of 4 is kept on the left side so refresh tokens containing
+    internal dashes are not truncated.
+    """
     parts = []
     last = 0
     for match in re.finditer(r"-{4,}", line):
-        parts.append(line[last:match.start()] + "-" * (len(match.group(0)) - 4))
+        run = len(match.group(0))
+        parts.append(line[last:match.start()])
+        for _ in range(run // 4 - 1):
+            parts.append("")
+        extra = run % 4
+        if extra and parts:
+            parts[-1] = parts[-1] + "-" * extra
         last = match.end()
     parts.append(line[last:])
     return parts
@@ -62,6 +76,11 @@ def parse_outlook_accounts(data: str) -> list[OutlookAccount]:
         if len(parts) not in {4, 5}:
             continue
         if not parts[0] or not parts[2] or not parts[3]:
+            continue
+        # A 4-field line whose last column is a channel name means the row was
+        # produced by an empty column collapsing the separators. Reject it
+        # instead of silently shifting every column to the left.
+        if len(parts) == 4 and str(parts[3]).strip().lower() in {"auto", "imap", "graph"}:
             continue
         raw_mode = parts[4] if len(parts) == 5 else "auto"
         if len(parts) == 5 and str(raw_mode).strip().lower() not in {"auto", "imap", "graph"}:

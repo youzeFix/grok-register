@@ -18,10 +18,32 @@ from urllib.parse import quote
 
 import requests
 
+# Microsoft 的 Front Door 端点（login.microsoftonline.com / outlook.office365.com）
+# 会按 TLS 指纹拒绝标准库 requests 的握手（SSLEOFError），而同一网络下
+# graph.microsoft.com 正常。curl_cffi 使用浏览器指纹栈，可以正常握手，
+# 因此 Microsoft 相关请求统一走 curl_cffi，并补齐 requests 的异常别名。
+try:  # pragma: no cover - 取决于运行环境是否安装了 curl_cffi
+    from curl_cffi import requests as _curl_requests
+    from curl_cffi.requests import exceptions as _curl_exceptions
+
+    for _name in ("Timeout", "ConnectionError", "RequestException"):
+        if not hasattr(_curl_requests, _name):
+            setattr(_curl_requests, _name, getattr(_curl_exceptions, _name))
+    requests = _curl_requests
+    _MICROSOFT_CURL_BACKEND = True
+except ImportError:  # pragma: no cover - 回退到标准库 requests
+    _MICROSOFT_CURL_BACKEND = False
+
 MICROSOFT_CONSUMERS_TOKEN_URL = "https://login.microsoftonline.com/consumers/oauth2/v2.0/token"
 MICROSOFT_COMMON_TOKEN_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
 OUTLOOK_IMAP_HOST = "outlook.office365.com"
 OUTLOOK_IMAP_PORT = 993
+# iCloud Mail uses a dedicated IMAP endpoint and authenticates with an
+# app-specific password instead of an OAuth2 access token. Apple documents
+# the app-specific password as the bearer credential of the XOAUTH2 exchange,
+# so the same XOAUTH2 code path can be reused unchanged.
+ICLOUD_IMAP_HOST = "imap.mail.me.com"
+ICLOUD_CLIENT_IDS = {"icloud", "apple", "icloud-app-password"}
 OUTLOOK_GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
 OUTLOOK_GRAPH_INBOX_KEY = "GRAPH:INBOX"
 OUTLOOK_GRAPH_JUNK_KEY = "GRAPH:JUNKEMAIL"
@@ -204,6 +226,8 @@ def _request_with_backoff(method: str, url: str, cancel_callback=None, **kwargs)
             raise RuntimeError("任务已停止")
         try:
             with _MICROSOFT_HTTP_SEMAPHORE:
+                if _MICROSOFT_CURL_BACKEND:
+                    kwargs.setdefault("impersonate", "chrome")
                 response = requests.request(method, url, **kwargs)
         except (requests.Timeout, requests.ConnectionError) as exc:
             last_error = exc
@@ -296,7 +320,19 @@ def _refresh_access_token(
     raise RuntimeError(last_error or f"{label} token 刷新失败")
 
 
+def is_icloud_account(account: OutlookAccount) -> bool:
+    """iCloud mailboxes are marked by a non-GUID client id sentinel."""
+    return str(account.client_id or "").strip().lower() in ICLOUD_CLIENT_IDS
+
+
 def refresh_outlook_imap_token(account: OutlookAccount, cancel_callback=None) -> str:
+    if is_icloud_account(account):
+        # iCloud has no OAuth2 refresh token; the app-specific password stored
+        # in the pool row is the bearer credential for the IMAP XOAUTH2 exchange.
+        password = str(account.password or "").strip()
+        if not password:
+            raise RuntimeError("iCloud 邮箱缺少 app 专用密码")
+        return password
     return _refresh_access_token(
         account,
         "https://outlook.office.com/IMAP.AccessAsUser.All offline_access",
@@ -321,7 +357,8 @@ def _xoauth2_auth_string(email: str, access_token: str) -> bytes:
 
 
 def _connect_imap(account: OutlookAccount, access_token: str) -> imaplib.IMAP4_SSL:
-    client = imaplib.IMAP4_SSL(OUTLOOK_IMAP_HOST, OUTLOOK_IMAP_PORT, timeout=20)
+    host = ICLOUD_IMAP_HOST if is_icloud_account(account) else OUTLOOK_IMAP_HOST
+    client = imaplib.IMAP4_SSL(host, OUTLOOK_IMAP_PORT, timeout=20)
     client.authenticate("XOAUTH2", lambda _: _xoauth2_auth_string(account.email, access_token))
     return client
 
