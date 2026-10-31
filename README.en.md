@@ -280,7 +280,7 @@ The project performs structural validation at startup and checks fields required
 
 | Setting | Description |
 | --- | --- |
-| `email_provider` | `duckmail` / `yyds` / `cloudflare` / `cloudmail` / `outlook` |
+| `email_provider` | `duckmail` / `yyds` / `cloudflare` / `cloudmail` / `outlook` / `remail` |
 | `register_count` | Number of registrations in the current batch |
 | `enable_nsfw` | Whether to attempt to enable NSFW after registration |
 | `sso_risk_gate_enabled` | Whether to check grok.com `botFlagSource` / `policy=deny` before storage; default `true` |

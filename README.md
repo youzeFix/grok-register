@@ -280,7 +280,7 @@ CLI 读取 `config.json`，通过校验后提示：
 
 | 配置项 | 说明 |
 | --- | --- |
-| `email_provider` | `duckmail` / `yyds` / `cloudflare` / `cloudmail` / `outlook` |
+| `email_provider` | `duckmail` / `yyds` / `cloudflare` / `cloudmail` / `outlook` / `remail` |
 | `register_count` | 本批次注册数量 |
 | `enable_nsfw` | 注册后是否尝试开启 NSFW |
 | `sso_risk_gate_enabled` | 入库前是否检查 grok.com `botFlagSource` / `policy=deny`，默认 `true` |
@@ -313,6 +313,24 @@ CLI 读取 `config.json`，通过校验后提示：
 ```
 
 `yyds_api_key` 和 `yyds_jwt` 至少填写一个。
+
+#### Remail（付费接码聚合）
+
+Remail（https://remail.aishop6.com ）通过 Open API 下单短效接码订单，支持 outlook.com、icloud.com 等真实邮箱后缀，收件通过订单的 `serviceToken` 调用取件接口完成：
+
+```json
+{
+  "email_provider": "remail",
+  "remail_api_base": "https://remail.aishop6.com",
+  "remail_api_key": "rk-xxxx",
+  "remail_project_id": "",
+  "remail_email_suffix": "outlook.com"
+}
+```
+
+- `remail_api_key` 必填（`rk-` 开头）；`remail_project_id` 留空时按 `remail_email_suffix` 自动挑选有公开库存的项目
+- 接码模式（`serviceMode=code`）每单只接收验证码；订单在平台钱包扣费，超时未收码由平台退款
+- 注意：Remail 订单不交付邮箱账号凭据，只提供取件 `serviceToken`，注册产出的邮箱无法长期接管
 
 #### Outlook 邮箱池
 

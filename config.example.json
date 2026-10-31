@@ -65,6 +65,10 @@
   "email_provider": "cloudflare",
   "yyds_api_key": "",
   "yyds_jwt": "",
+  "remail_api_base": "https://remail.aishop6.com",
+  "remail_api_key": "",
+  "remail_project_id": "",
+  "remail_email_suffix": "outlook.com",
   "cpa_oidc_request_timeout_sec": 15,
   "cpa_oidc_poll_timeout_sec": 15,
   "grok2api_allow_legacy_full_save": false

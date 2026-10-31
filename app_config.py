@@ -75,6 +75,10 @@ DEFAULT_CONFIG = {
     "email_provider": "duckmail",
     "yyds_api_key": "",
     "yyds_jwt": "",
+    "remail_api_base": "https://remail.aishop6.com",
+    "remail_api_key": "",
+    "remail_project_id": "",
+    "remail_email_suffix": "outlook.com",
     "defaultDomains": "",
 }
 
@@ -151,7 +155,7 @@ def validate_config_structure(raw):
     for key in string_keys:
         cfg[key] = _require_string(cfg, key)
     enums = {
-        "email_provider": {"duckmail", "yyds", "cloudflare", "cloudmail", "outlook"},
+        "email_provider": {"duckmail", "yyds", "cloudflare", "cloudmail", "outlook", "remail"},
         "cloudflare_auth_mode": {"query-key", "bearer", "x-api-key", "x-admin-auth", "none"},
         "grok2api_pool_name": {"ssoBasic", "ssoSuper"},
         "proxy_mode": {"auto", "direct", "single", "pool"},
@@ -180,7 +184,7 @@ def validate_config_structure(raw):
     url_keys = {
         "cloudflare_api_base", "cloudmail_api_base",
         "grok2api_remote_base", "cpa_base_url",
-        "proxy_pool_subscription_url",
+        "proxy_pool_subscription_url", "remail_api_base",
     }
     for key in url_keys:
         value = cfg[key]
@@ -211,6 +215,8 @@ def validate_run_requirements(cfg):
             raise ConfigError("Cloud Mail 模式缺少必需配置: " + ", ".join(missing))
     if provider == "yyds" and not (cfg["yyds_api_key"] or cfg["yyds_jwt"]):
         raise ConfigError("YYDS 模式需要至少配置 yyds_api_key 或 yyds_jwt")
+    if provider == "remail" and not cfg["remail_api_key"]:
+        raise ConfigError("Remail 模式需要配置 remail_api_key")
     if provider == "outlook":
         path = os.path.realpath(os.path.abspath(os.path.expanduser(cfg["outlook_accounts_file"])))
         if not os.path.isfile(path):

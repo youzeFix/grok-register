@@ -1,5 +1,6 @@
 """接入临时邮箱服务并负责邮箱创建、邮件轮询和验证码提取。"""
 import hashlib
+import json
 import re
 import secrets
 import string
@@ -43,7 +44,7 @@ def _detail_retry_attempt(state, message_id, now=None):
     record["next_retry_at"] = current + delay
     return attempt
 
-_OWN_NAMES = {'cloudmail_build_headers', 'cloudmail_preflight', 'cloudmail_wait_for_auth', 'cloudmail_get_email_and_token', 'get_messages', 'cloudflare_get_messages', 'get_yyds_api_key', 'yyds_generate_username', 'yyds_get_domains', 'yyds_get_email_and_token', 'yyds_get_oai_code', 'get_email_provider', 'cloudflare_get_domains', 'extract_verification_code', 'get_cloudflare_api_base', 'cloudflare_apply_auth_params', 'duckmail_get_oai_code', 'create_account', 'get_yyds_jwt', 'get_message_detail', 'yyds_create_account', 'get_duckmail_api_key', 'get_cloudflare_path', 'cloudflare_create_account', 'cloudflare_get_token', 'cloudflare_get_oai_code', 'get_cloudmail_public_token', 'generate_username', 'yyds_get_message_detail', 'cloudflare_next_default_domain', 'yyds_get_messages', 'yyds_get_token', 'get_domains', 'get_token', 'cloudflare_create_temp_address', 'get_cloudflare_api_key', 'get_cloudmail_path', 'get_cloudmail_api_base', 'cloudmail_get_oai_code', 'cloudflare_build_headers', 'cloudflare_is_admin_create_path', 'cloudmail_next_domain', 'cloudflare_get_message_detail', 'cloudmail_get_messages', 'get_user_agent', 'yyds_pick_domain', '_pick_list_payload', 'get_email_and_token', 'get_oai_code', 'get_cloudflare_auth_mode', 'pick_domain'}
+_OWN_NAMES = {'cloudmail_build_headers', 'cloudmail_preflight', 'cloudmail_wait_for_auth', 'cloudmail_get_email_and_token', 'get_messages', 'cloudflare_get_messages', 'get_yyds_api_key', 'yyds_generate_username', 'yyds_get_domains', 'yyds_get_email_and_token', 'yyds_get_oai_code', 'get_email_provider', 'cloudflare_get_domains', 'extract_verification_code', 'get_cloudflare_api_base', 'cloudflare_apply_auth_params', 'duckmail_get_oai_code', 'create_account', 'get_yyds_jwt', 'get_message_detail', 'yyds_create_account', 'get_duckmail_api_key', 'get_cloudflare_path', 'cloudflare_create_account', 'cloudflare_get_token', 'cloudflare_get_oai_code', 'get_cloudmail_public_token', 'generate_username', 'yyds_get_message_detail', 'cloudflare_next_default_domain', 'yyds_get_messages', 'yyds_get_token', 'get_domains', 'get_token', 'cloudflare_create_temp_address', 'get_cloudflare_api_key', 'get_cloudmail_path', 'get_cloudmail_api_base', 'cloudmail_get_oai_code', 'cloudflare_build_headers', 'cloudflare_is_admin_create_path', 'cloudmail_next_domain', 'cloudflare_get_message_detail', 'cloudmail_get_messages', 'get_user_agent', 'yyds_pick_domain', '_pick_list_payload', 'get_email_and_token', 'get_oai_code', 'get_cloudflare_auth_mode', 'pick_domain', 'get_remail_api_base', 'get_remail_api_key', 'get_remail_project_id', 'get_remail_email_suffix', 'remail_headers', 'remail_list_projects', 'remail_pick_project_id', 'remail_get_order', 'remail_wait_order_active', 'remail_create_order', 'remail_get_email_and_token', 'remail_get_messages', 'remail_get_message_detail', 'remail_get_oai_code'}
 
 
 _RUNTIME_DEPENDENCIES = (
@@ -66,7 +67,8 @@ def normalize_mail_body(*sources):
     for source in sources:
         if not isinstance(source, dict):
             continue
-        for key in ("text", "raw", "content", "intro", "body", "snippet"):
+        for key in ("text", "raw", "content", "intro", "body", "snippet",
+                    "body_preview", "bodyPreview", "preview"):
             value = source.get(key)
             values = value if isinstance(value, (list, tuple)) else [value]
             for item in values:
@@ -817,6 +819,8 @@ def get_email_and_token(api_key=None):
     provider = get_email_provider()
     if provider == "outlook":
         return _get_outlook_runtime().acquire()
+    if provider == "remail":
+        return remail_get_email_and_token(api_key=api_key)
     if provider == "yyds":
         return yyds_get_email_and_token(api_key=api_key, jwt=get_yyds_jwt())
     if provider == "cloudmail":
@@ -921,6 +925,15 @@ def get_oai_code(
             poll_interval=poll_interval,
             log_callback=log_callback,
             jwt=get_yyds_jwt(),
+            cancel_callback=cancel_callback,
+        )
+    if provider == "remail":
+        return remail_get_oai_code(
+            dev_token,
+            email,
+            timeout=timeout,
+            poll_interval=poll_interval,
+            log_callback=log_callback,
             cancel_callback=cancel_callback,
         )
     if provider == "cloudmail":
@@ -1163,6 +1176,246 @@ def yyds_pick_domain(api_key=None, jwt=None):
     if verified:
         return verified[0]["domain"]
     raise Exception("YYDS 无已验证域名可用")
+
+
+REMAIL_API_BASE = "https://remail.aishop6.com"
+REMAIL_ORDER_ACTIVATE_TIMEOUT = 60.0
+REMAIL_ORDER_FAILURE_STATUSES = {"refunded", "failed", "closed"}
+
+
+def get_remail_api_base():
+    return (str(config.get("remail_api_base", "") or "").strip() or REMAIL_API_BASE).rstrip("/")
+
+
+def get_remail_api_key():
+    return str(config.get("remail_api_key", "") or "").strip()
+
+
+def get_remail_project_id():
+    return str(config.get("remail_project_id", "") or "").strip()
+
+
+def get_remail_email_suffix():
+    suffix = str(config.get("remail_email_suffix", "") or "").strip().lower()
+    return suffix or "outlook.com"
+
+
+REMAIL_PLATFORM_HINTS = ("grok", "x.ai")
+
+
+def remail_pick_project_id(email_suffix, api_key=None):
+    """未配置项目 ID 时，按邮箱后缀自动挑一个有公开库存且支持接码的项目。
+
+    供应商按项目转发邮件：只有与项目目标平台匹配的发件人邮件才会进入取件
+    通道，因此优先选择 targetPlatform 命中 grok/x.ai 的项目，其次退回任意
+    有库存的项目。
+    """
+    preferred = []
+    candidates = []
+    for project in remail_list_projects(api_key=api_key):
+        target = str(project.get("targetPlatform") or "").lower()
+        is_preferred = any(h in target for h in REMAIL_PLATFORM_HINTS)
+        for product in project.get("products") or []:
+            if product.get("codeEnabled") is False:
+                continue
+            inventory = product.get("suffixes") or product.get("suffixInventory") or []
+            if any(
+                str(inv.get("suffix", "") or "").lower() == email_suffix
+                and int(inv.get("publicAvailable") or 0) > 0
+                for inv in inventory
+            ):
+                (preferred if is_preferred else candidates).append(project)
+                break
+    pool = preferred or candidates
+    if not pool:
+        raise Exception(
+            f"Remail 没有支持 {email_suffix} 公开库存的项目，"
+            "请在配置里手动指定 remail_project_id"
+        )
+    chosen = pool[0]
+    print(f"[*] Remail 自动选择项目: {chosen.get('name')} (id={chosen.get('id')}, 平台={chosen.get('targetPlatform')})")
+    return str(chosen.get("projectId") or chosen.get("id"))
+
+
+def remail_headers(api_key=None):
+    key = api_key or get_remail_api_key()
+    if not key:
+        raise Exception("Remail API Key 未配置")
+    return {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+
+
+def remail_list_projects(api_key=None):
+    """查询项目列表，返回 projects 数组（调试/自动选项目用）。"""
+    headers = remail_headers(api_key)
+    resp = http_get(f"{get_remail_api_base()}/v1/open/projects", headers=headers, proxies={})
+    resp.raise_for_status()
+    data = resp.json()
+    if isinstance(data, dict):
+        return data.get("data", {}).get("items") or data.get("data") or data.get("items") or []
+    return data or []
+
+
+def remail_get_order(order_no, api_key=None):
+    headers = remail_headers(api_key)
+    resp = http_get(f"{get_remail_api_base()}/v1/open/orders/{order_no}", headers=headers, proxies={})
+    resp.raise_for_status()
+    return resp.json()
+
+
+def remail_wait_order_active(
+    order_no, timeout=REMAIL_ORDER_ACTIVATE_TIMEOUT, poll_interval=2.0,
+    api_key=None, cancel_callback=None,
+):
+    """下单后轮询订单直到 active（邮箱分配完成且可取件）。"""
+    deadline = time.time() + timeout
+    last_status = ""
+    while time.time() < deadline:
+        if cancel_callback:
+            raise_if_cancelled(cancel_callback)
+        order = remail_get_order(order_no, api_key=api_key)
+        last_status = str(order.get("status") or "")
+        if last_status == "active":
+            return order
+        if last_status in REMAIL_ORDER_FAILURE_STATUSES:
+            raise Exception(
+                f"Remail 订单 {order_no} 失败: status={last_status} "
+                f"failureCode={order.get('failureCode')}"
+            )
+        sleep_with_cancel(poll_interval, cancel_callback)
+    raise Exception(f"Remail 订单 {order_no} 超时未激活: status={last_status}")
+
+
+def remail_create_order(api_key=None, project_id=None, email_suffix=None):
+    headers = remail_headers(api_key)
+    suffix = str(email_suffix or get_remail_email_suffix()).lower()
+    pid_raw = str(project_id or get_remail_project_id() or "").strip()
+    if not pid_raw:
+        pid_raw = remail_pick_project_id(suffix, api_key=api_key)
+    payload = {"projectId": int(pid_raw), "emailSuffix": suffix}
+    idempotency_key = f"grok-register-{secrets.token_hex(12)}"
+    resp = http_post(
+        f"{get_remail_api_base()}/v1/open/orders",
+        params={"serviceMode": "code"},
+        json=payload,
+        headers={**headers, "Idempotency-Key": idempotency_key},
+        proxies={},
+    )
+    if resp.status_code >= 400:
+        try:
+            error_data = json.dumps(resp.json(), ensure_ascii=False)
+        except Exception:
+            error_data = resp.text[:200]
+        raise Exception(f"Remail 下单失败: {resp.status_code} - {error_data}")
+    order = resp.json()
+    order_no = order.get("orderNo")
+    if not order_no:
+        raise Exception(f"Remail 下单响应缺少 orderNo: {order}")
+    if not order.get("status") == "active" or not order.get("deliveryEmail") or not order.get("serviceToken"):
+        order = remail_wait_order_active(order_no, api_key=api_key)
+    return order
+
+
+def remail_get_email_and_token(api_key=None, project_id=None, email_suffix=None):
+    order = remail_create_order(
+        api_key=api_key, project_id=project_id, email_suffix=email_suffix
+    )
+    address = str(order.get("deliveryEmail") or "").strip()
+    token = str(order.get("serviceToken") or "").strip()
+    if not address or not token:
+        raise Exception(f"Remail 订单缺少 deliveryEmail/serviceToken: {order}")
+    print(f"[*] 已创建 Remail 邮箱: {address} (订单 {order.get('orderNo')})")
+    return address, token
+
+
+def remail_get_messages(address, token=None):
+    """取件读取邮件：pickup 接口使用订单交付邮箱 + serviceToken，无需 API Key。"""
+    resp = http_get(
+        f"{get_remail_api_base()}/v1/pickup",
+        params={"email": address, "token": token},
+        proxies={},
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return data.get("items") or []
+
+
+def remail_get_message_detail(message_id, address, token=None):
+    resp = http_get(
+        f"{get_remail_api_base()}/v1/pickup/messages/{message_id}",
+        params={"email": address, "token": token},
+        proxies={},
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def remail_get_oai_code(
+    token,
+    address,
+    timeout=180,
+    poll_interval=3,
+    log_callback=None,
+    cancel_callback=None,
+):
+    deadline = time.time() + timeout
+    detail_retries = {}
+    while time.time() < deadline:
+        if cancel_callback:
+            raise_if_cancelled(cancel_callback)
+        try:
+            messages = remail_get_messages(address, token=token)
+        except Exception as exc:
+            if log_callback:
+                log_callback(f"[Debug] Remail 取件失败: {exc}")
+            sleep_with_cancel(poll_interval, cancel_callback)
+            continue
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            recipient = str(msg.get("recipient") or "").lower()
+            if recipient and address.lower() not in recipient:
+                continue
+
+            # Remail 服务端已提取验证码时直接用
+            code = str(msg.get("verificationCode") or "").strip()
+            if code:
+                subject = str(msg.get("subject") or "")
+                if log_callback:
+                    log_callback(f"[*] Remail 从 {subject} 提取到验证码: {code}")
+                return code
+
+            subject = str(msg.get("subject") or "")
+            combined = normalize_mail_body(msg)
+            code = extract_verification_code(combined, subject)
+            if code:
+                if log_callback:
+                    log_callback(f"[*] Remail 从邮件列表中提取到验证码: {code}")
+                return code
+
+            message_id = msg.get("id")
+            detail_attempt = _detail_retry_attempt(detail_retries, message_id)
+            if not detail_attempt:
+                continue
+            try:
+                detail = remail_get_message_detail(message_id, address, token=token)
+            except Exception as exc:
+                if log_callback:
+                    log_callback(
+                        f"[Debug] Remail 获取邮件详情失败 id={message_id} "
+                        f"attempt={detail_attempt}: {exc}"
+                    )
+                continue
+            if detail.get("body"):
+                combined = normalize_mail_body(detail)
+            code = extract_verification_code(
+                combined, str(detail.get("subject") or subject)
+            )
+            if code:
+                if log_callback:
+                    log_callback(f"[*] Remail 从邮件中提取到验证码: {code}")
+                return code
+        sleep_with_cancel(poll_interval, cancel_callback)
+    raise VerificationCodeUnavailable(f"Remail 在 {timeout}s 内未收到验证码邮件")
 
 
 
