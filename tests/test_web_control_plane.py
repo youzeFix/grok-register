@@ -1,6 +1,8 @@
+import tempfile
 import threading
 import time
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 try:
@@ -76,6 +78,31 @@ class WebControlPlaneTests(unittest.TestCase):
         self.assertIn("/proxy-pool.js", response.text)
         self.assertIn("/proxy-pool.css", response.text)
         self.assertEqual(self.client.get("/health").json(), {"ok": True})
+
+    def test_react_build_and_hashed_assets_are_served_when_present(self):
+        with tempfile.TemporaryDirectory() as directory:
+            dist = Path(directory)
+            assets = dist / "assets"
+            assets.mkdir()
+            (dist / "index.html").write_text(
+                '<html><script type="module" src="/assets/app-abc123.js"></script></html>',
+                encoding="utf-8",
+            )
+            (assets / "app-abc123.js").write_text("console.log('react');", encoding="utf-8")
+            with patch.object(self.server, "FRONTEND_DIST", dist), patch.object(
+                self.server, "FRONTEND_ASSETS", assets
+            ):
+                index = self.client.get("/")
+                asset = self.client.get("/assets/app-abc123.js")
+                missing = self.client.get("/assets/missing.js")
+
+        self.assertEqual(index.status_code, 200)
+        self.assertEqual(index.headers["cache-control"], "no-store")
+        self.assertIn("/assets/app-abc123.js", index.text)
+        self.assertEqual(asset.status_code, 200)
+        self.assertEqual(asset.headers["cache-control"], "public, max-age=31536000, immutable")
+        self.assertEqual(asset.text, "console.log('react');")
+        self.assertEqual(missing.status_code, 404)
 
     def test_get_config_reads_existing_engine_config(self):
         cfg = self._base_config()
@@ -301,6 +328,218 @@ class WebControlPlaneTests(unittest.TestCase):
         next_page = self.client.get("/api/logs?after=%s" % latest).json()
         self.assertEqual(len(next_page["entries"]), 1)
         self.assertIn("new-line", next_page["entries"][0]["line"])
+
+
+    def _new_database(self):
+        from storage.database import Database
+
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        return Database(Path(directory.name) / "accounts.sqlite3")
+
+    def test_account_api_filters_details_and_exports_legacy_format(self):
+        database = self._new_database()
+        run_id = database.create_registration_run(2)
+        first, _ = database.insert_account({
+            "email": "first@example.com", "password": "pw1", "sso": "token1",
+            "email_provider": "duckmail", "created_at": "2026-10-30T12:00:00+00:00",
+            "registration_run_id": run_id,
+        })
+        second, _ = database.insert_account({
+            "email": "second@example.com", "password": "pw2", "sso": "token2",
+            "email_provider": "cloudmail", "created_at": "2026-10-31T12:00:00+00:00",
+            "registration_run_id": run_id,
+        })
+        database.update_account_integration_status(
+            second, "succeeded", "", "not_requested", "", "failed", "remote error",
+        )
+        database.create_registration_attempt(
+            run_id, slot_index=1, attempt_number=1, worker_key="worker-1",
+            stage="postprocess", status="succeeded", account_id=second,
+        )
+        database.create_registration_attempt(
+            run_id, slot_index=2, attempt_number=1, worker_key="worker-2",
+            stage="browser_start", status="failed", error_type="TimeoutError",
+            error_message="browser start timed out", traceback="Traceback: timeout",
+            failure_type="browser", screenshot_path="/private/failure.png",
+        )
+        database.update_registration_run(
+            run_id, status="completed", processed_count=2, success_count=1, failed_count=1,
+        )
+
+        with patch.object(self.server, "_get_database", return_value=database):
+            listed = self.client.get(
+                "/api/accounts?limit=1&offset=0&search=second&email_provider=cloudmail"
+                "&cpa_status=succeeded&date_from=2026-10-31&date_to=2026-10-31"
+            )
+            detail = self.client.get("/api/accounts/%s" % second)
+            exported = self.client.post("/api/accounts/export", json={"ids": [second]})
+            invalid_export = self.client.post("/api/accounts/export", json={"ids": [1.5]})
+            stats = self.client.get("/api/stats")
+            history = self.client.get("/api/jobs/history")
+            attempts = self.client.get("/api/jobs/history/%s/attempts" % run_id)
+            attempts_page = self.client.get(
+                "/api/jobs/history/%s/attempts?limit=1&offset=1" % run_id
+            )
+            missing_attempts = self.client.get("/api/jobs/history/999/attempts")
+
+        self.assertEqual(listed.status_code, 200)
+        payload = listed.json()
+        self.assertEqual(payload["total"], 1)
+        self.assertEqual(payload["limit"], 1)
+        self.assertEqual(payload["items"][0]["id"], second)
+        self.assertNotIn("password", payload["items"][0])
+        self.assertNotIn("sso", payload["items"][0])
+        self.assertEqual(detail.status_code, 200)
+        self.assertEqual(detail.headers["cache-control"], "no-store")
+        self.assertEqual(detail.json()["account"]["attempts"][0]["account_id"], second)
+        self.assertEqual(exported.status_code, 200)
+        self.assertEqual(invalid_export.status_code, 400)
+        self.assertEqual(exported.text, "second@example.com----pw2----token2\n")
+        self.assertEqual(stats.status_code, 200)
+        self.assertEqual(stats.json()["success_rate"], 50.0)
+        self.assertEqual(stats.json()["by_grok2api_remote_status"], {"failed": 1, "unknown": 1})
+        self.assertEqual(history.status_code, 200)
+        self.assertEqual(history.json()["items"][0]["attempt_count"], 2)
+        self.assertEqual(history.json()["items"][0]["success_rate"], 50.0)
+        self.assertEqual(attempts.status_code, 200)
+        self.assertEqual(attempts.headers["cache-control"], "no-store")
+        self.assertEqual(attempts.json()["total"], 2)
+        self.assertEqual(attempts_page.status_code, 200)
+        self.assertEqual(attempts_page.json()["total"], 2)
+        self.assertEqual(attempts_page.json()["limit"], 1)
+        self.assertEqual(attempts_page.json()["offset"], 1)
+        self.assertEqual(len(attempts_page.json()["items"]), 1)
+        diagnostic = next(item for item in attempts.json()["items"] if item["failure_type"])
+        self.assertEqual(diagnostic["failure_type"], "browser")
+        self.assertEqual(diagnostic["screenshot_path"], "/private/failure.png")
+        self.assertIn("Traceback", diagnostic["traceback"])
+        self.assertEqual(missing_attempts.status_code, 404)
+        self.assertNotEqual(first, second)
+
+    def test_account_api_delete_single_and_bulk(self):
+        database = self._new_database()
+        first, _ = database.insert_account({"email": "one@example.com", "sso": "one"})
+        second, _ = database.insert_account({"email": "two@example.com", "sso": "two"})
+        with patch.object(self.server, "_get_database", return_value=database):
+            single = self.client.delete("/api/accounts/%s" % first)
+            bulk = self.client.request("DELETE", "/api/accounts", json={"ids": [second, second]})
+            invalid_bool = self.client.request("DELETE", "/api/accounts", json={"ids": [True]})
+            invalid_float = self.client.request("DELETE", "/api/accounts", json={"ids": [1.5]})
+        self.assertEqual(single.status_code, 200)
+        self.assertEqual(bulk.status_code, 200)
+        self.assertEqual(bulk.json()["deleted_count"], 1)
+        self.assertEqual(invalid_bool.status_code, 400)
+        self.assertEqual(invalid_float.status_code, 400)
+        self.assertEqual(database.account_count(), 0)
+
+    def test_account_api_rejects_invalid_date_filter(self):
+        database = self._new_database()
+        with patch.object(self.server, "_get_database", return_value=database):
+            response = self.client.get("/api/accounts?date_from=not-a-date")
+        self.assertEqual(response.status_code, 400)
+
+    def test_registration_screenshot_api_serves_only_database_diagnostics_files(self):
+        database = self._new_database()
+        run_id = database.create_registration_run(1)
+        diagnostics = Path(database.path).resolve().parent / "diagnostics" / "registration"
+        diagnostics.mkdir(parents=True)
+        screenshot = diagnostics / "failure.png"
+        screenshot.write_bytes(b"fake-png")
+        attempt_id = database.create_registration_attempt(
+            run_id, 1, 1, "worker-1", "browser_start", "failed",
+            error_type="TimeoutError", screenshot_path=str(screenshot),
+        )
+        outside = Path(database.path).resolve().parent / "outside.png"
+        outside.write_bytes(b"not-a-screenshot")
+        outside_attempt = database.create_registration_attempt(
+            run_id, 2, 1, "worker-2", "browser_start", "failed",
+            error_type="TimeoutError", screenshot_path=str(outside),
+        )
+
+        with patch.object(self.server, "_get_database", return_value=database):
+            response = self.client.get(
+                "/api/jobs/history/%s/attempts/%s/screenshot" % (run_id, attempt_id)
+            )
+            outside_response = self.client.get(
+                "/api/jobs/history/%s/attempts/%s/screenshot" % (run_id, outside_attempt)
+            )
+            wrong_run = self.client.get(
+                "/api/jobs/history/999/attempts/%s/screenshot" % attempt_id
+            )
+            cross_origin = self.client.get(
+                "/api/jobs/history/%s/attempts/%s/screenshot" % (run_id, attempt_id),
+                headers={"origin": "https://attacker.example"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["cache-control"], "no-store")
+        self.assertEqual(response.headers["x-content-type-options"], "nosniff")
+        self.assertEqual(response.headers["content-type"], "image/png")
+        self.assertEqual(response.content, b"fake-png")
+        self.assertEqual(outside_response.status_code, 404)
+        self.assertEqual(wrong_run.status_code, 404)
+        self.assertEqual(cross_origin.status_code, 403)
+
+    def test_account_api_requires_same_origin_for_sensitive_detail(self):
+        database = self._new_database()
+        account_id, _ = database.insert_account({"email": "one@example.com", "sso": "token"})
+        run_id = database.create_registration_run(1)
+        with patch.object(self.server, "_get_database", return_value=database):
+            response = self.client.get(
+                "/api/accounts/%s" % account_id,
+                headers={"origin": "https://attacker.example"},
+            )
+            attempts = self.client.get(
+                "/api/jobs/history/%s/attempts" % run_id,
+                headers={"origin": "https://attacker.example"},
+            )
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(attempts.status_code, 403)
+
+    def test_database_api_imports_existing_legacy_files_before_listing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "accounts-old.txt").write_text(
+                "legacy@example.com----legacy-pw----legacy-token\n",
+                encoding="utf-8",
+            )
+            with patch.object(self.server, "ROOT", root), patch.object(
+                self.server, "_load_config_if_idle",
+                return_value={"database_path": str(root / "accounts.sqlite3")},
+            ), patch.object(self.server, "_database_cache", {}):
+                database = self.server._get_database()
+                self.assertEqual(database.account_count(), 1)
+                account = database.list_accounts()["items"][0]
+                self.assertEqual(account["email"], "legacy@example.com")
+                self.assertEqual(account["email_provider"], "")
+
+    def test_database_api_imports_legacy_files_from_configured_output_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "project"
+            output = Path(directory) / "persistent-output"
+            root.mkdir()
+            output.mkdir()
+            (root / "accounts-old.txt").write_text(
+                "root@example.com----root-pw----root-token\n", encoding="utf-8"
+            )
+            (output / "accounts-container.txt").write_text(
+                "output@example.com----output-pw----output-token\n", encoding="utf-8"
+            )
+            with patch.object(self.server, "ROOT", root), patch.dict(
+                "os.environ", {"GROK_REGISTER_OUTPUT_DIR": str(output)}
+            ), patch.object(
+                self.server, "_load_config_if_idle",
+                return_value={"database_path": str(root / "accounts.sqlite3")},
+            ), patch.object(self.server, "_database_cache", {}):
+                database = self.server._get_database()
+                accounts = database.list_accounts()["items"]
+
+            self.assertEqual(
+                {account["email"] for account in accounts},
+                {"root@example.com", "output@example.com"},
+            )
+
 
 
 if __name__ == "__main__":

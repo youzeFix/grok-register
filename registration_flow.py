@@ -1,13 +1,17 @@
 """编排 GUI 与 CLI 共用的单账号注册和批量执行流程。"""
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 import threading
+import traceback
 from typing import Any, Callable, Dict, Optional, Tuple
 
-from app_config import config as app_config
+from app_config import ConfigError, config as app_config
+from proxy_protocols import ProxyProtocolError
 from sso_risk import RegistrationRiskDenied
 from proxy_pool import (
     ProxyAcquireCancelled,
     ProxyPoolError,
+    ProxyConfigurationError,
     ProxyTransportError,
     begin_registration_slot,
     classify_proxy_network_error,
@@ -34,6 +38,7 @@ SAFE_NEW_LEASE = "safe_new_lease"
 SAME_LEASE_RECOVERY = "same_lease_recovery"
 OUTCOME_UNCERTAIN = "outcome_uncertain"
 NO_RETRY = "no_retry"
+FATAL = "fatal"
 
 
 def _set_registration_stage(value):
@@ -45,11 +50,26 @@ def current_registration_stage():
     return getattr(_STAGE_TLS, "stage", STAGE_LEASE_ACQUIRE)
 
 
+def _is_non_retryable_pre_submit_error(error):
+    while error is not None:
+        if isinstance(error, (
+            ConfigError, ProxyConfigurationError, ProxyProtocolError,
+            FileNotFoundError, PermissionError, ImportError, AttributeError,
+        )):
+            return True
+        if isinstance(error, ProxyPoolError) and classify_proxy_network_error(error) in (
+            "configuration", "compatibility",
+        ):
+            return True
+        error = error.__cause__ or error.__context__
+    return False
+
+
 def registration_retry_disposition(stage, error=None):
-    """Classify whether a failed attempt may safely be replayed with a new lease."""
+    """Classify retry safety from the current registration stage."""
     stage = str(stage or STAGE_LEASE_ACQUIRE)
     if stage in (STAGE_LEASE_ACQUIRE, STAGE_BROWSER_START, STAGE_PAGE_OPEN):
-        return SAFE_NEW_LEASE
+        return FATAL if _is_non_retryable_pre_submit_error(error) else SAFE_NEW_LEASE
     if stage == STAGE_CODE_WAIT:
         return SAME_LEASE_RECOVERY
     if stage in (STAGE_EMAIL_SUBMIT, STAGE_CODE_SUBMIT, STAGE_PROFILE_SUBMIT, STAGE_SSO_WAIT):
@@ -82,6 +102,7 @@ class RegistrationCallbacks:
     log: Callable[[str], None]
     cancelled: Callable[[], bool]
     stop_all: Optional[Callable[[], None]] = None
+    record_attempt: Optional[Callable[[Dict[str, Any]], None]] = None
 
 
 @dataclass
@@ -107,6 +128,9 @@ class RegistrationOperations:
     internal_stage_markers: bool = False
     screen_sso: Optional[Callable[[str, str], Any]] = None
     preflight_mail: Optional[Callable[[], Any]] = None
+    persist_account_record: Optional[Callable[[Any], Dict[str, Any]]] = None
+    persist_account_status: Optional[Callable[[int, Dict[str, Any], Dict[str, Any], str, str], Any]] = None
+    capture_failure_diagnostics: Optional[Callable[[Dict[str, Any]], str]] = None
 
 
 @dataclass
@@ -130,6 +154,9 @@ class OutputResult:
     save_error: str = ""
     pools: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     cpa: Dict[str, Any] = field(default_factory=dict)
+    legacy_export_error: str = ""
+    account_id: Optional[int] = None
+    status_persist_error: str = ""
 
 
 @dataclass
@@ -250,40 +277,81 @@ def persist_account_result(result, callbacks, ops):
     screen = getattr(ops, "screen_sso", None)
     if callable(screen):
         screen(result.sso, result.email)
+    legacy_export_error = ""
+    account_id = None
     try:
-        ops.persist_account_line(result.email, result.password, result.sso)
-        saved = True; save_error = ""; pending_saved = False
+        persist_record = getattr(ops, "persist_account_record", None)
+        if callable(persist_record):
+            persistence = persist_record(result)
+            if not isinstance(persistence, dict):
+                raise TypeError("persist_account_record must return a mapping")
+            account_id = persistence.get("account_id")
+            if type(account_id) is not int or account_id < 1:
+                raise ValueError("persist_account_record must return a positive account_id")
+            legacy_export_error = str(persistence.get("legacy_export_error") or "")
+        else:
+            ops.persist_account_line(result.email, result.password, result.sso)
+        saved = True
+        save_error = ""
+        pending_saved = False
+        if legacy_export_error:
+            callbacks.log("[!] SQLite 已保存账号，但旧版 TXT 兼容导出失败: %s" % legacy_export_error)
     except Exception as exc:
-        saved = False; save_error = str(exc)
+        saved = False
+        save_error = str(exc)
         try:
-            pending_saved = bool(ops.queue_unsaved_result({"email": result.email, "password": result.password, "sso": result.sso, "profile": result.profile}, save_error))
+            pending_saved = bool(ops.queue_unsaved_result(
+                {"email": result.email, "password": result.password, "sso": result.sso, "profile": result.profile},
+                save_error,
+            ))
         except Exception as pending_exc:
-            pending_saved = False; callbacks.log(f"[!] pending 队列写入异常: {pending_exc}")
-        callbacks.log(f"[!] 账号已注册但主结果文件保存失败: {save_error}")
-        callbacks.log("[!] 未保存账号已写入 pending 队列，等待人工重试" if pending_saved else "[!] pending 队列也写入失败；已停止向下游发布此账号")
+            pending_saved = False
+            callbacks.log("[!] pending 队列写入异常: %s" % pending_exc)
+        callbacks.log("[!] 账号已注册但主结果文件保存失败: %s" % save_error)
+        callbacks.log(
+            "[!] 未保存账号已写入 pending 队列，等待人工重试"
+            if pending_saved else "[!] pending 队列也写入失败；已停止向下游发布此账号"
+        )
         if not pending_saved:
             return OutputResult(
                 registered=True, saved=False, pending_saved=False, save_error=save_error,
                 cpa={"ok": False, "skipped": True, "reason": "account_not_persisted"},
             )
+
     try:
         pools = ops.add_tokens(result.sso, result.email)
         if not isinstance(pools, dict):
             raise TypeError("token pool result must be a dict")
     except Exception as exc:
-        callbacks.log(f"[!] token 入池后处理异常，账号结果已保留: {exc}")
+        callbacks.log("[!] token 入池后处理异常，账号结果已保留: %s" % exc)
         pools = {"internal": {"enabled": True, "ok": False, "error": str(exc)}}
     for name, state in pools.items():
         if isinstance(state, dict) and state.get("enabled") and not state.get("ok"):
-            callbacks.log(f"[!] grok2api {name} 入池失败: {state.get('error')}")
+            callbacks.log("[!] grok2api %s 入池失败: %s" % (name, state.get("error")))
+
     try:
         cpa = ops.export_cpa(result.email, result.password, result.sso)
         if not isinstance(cpa, dict):
             raise TypeError("CPA result must be a dict")
     except Exception as exc:
-        callbacks.log(f"[!] CPA 导出后处理异常，账号结果已保留: {exc}")
+        callbacks.log("[!] CPA 导出后处理异常，账号结果已保留: %s" % exc)
         cpa = {"ok": False, "skipped": False, "error": str(exc)}
-    return OutputResult(registered=True, saved=saved, pending_saved=pending_saved, save_error=save_error, pools=pools, cpa=cpa)
+
+    status_persist_error = ""
+    persist_status = getattr(ops, "persist_account_status", None)
+    if callable(persist_status) and account_id is not None:
+        try:
+            if persist_status(account_id, pools, cpa, result.password, result.sso) is False:
+                raise RuntimeError("account row was not found while saving integration status")
+        except Exception as exc:
+            status_persist_error = str(exc)
+            callbacks.log("[!] CPA/Grok2API 状态写入 SQLite 失败: %s" % exc)
+
+    return OutputResult(
+        registered=True, saved=saved, pending_saved=pending_saved, save_error=save_error,
+        pools=pools, cpa=cpa, legacy_export_error=legacy_export_error,
+        account_id=account_id, status_persist_error=status_persist_error,
+    )
 
 
 def _notify_observer(observer, result, account, output, callbacks):
@@ -291,6 +359,117 @@ def _notify_observer(observer, result, account, output, callbacks):
         observer(result, account, output)
     except Exception as exc:
         callbacks.log(f"[Debug] observer 执行失败: {exc}")
+
+
+def _attempt_failure_type(status, error, stage, output):
+    if status == "cancelled":
+        return "cancelled"
+    if status == "uncertain":
+        return "outcome_uncertain"
+    if status == "rejected":
+        if isinstance(error, EmailSignupUnavailable):
+            return "signup_rejected"
+        if isinstance(error, RegistrationRiskDenied):
+            return "risk_denied"
+        return "rejected"
+    if status == "registered_unsaved":
+        return "persistence"
+    if status in ("retrying", "failed"):
+        if error is not None and (
+            isinstance(error, ProxyPoolError) or is_proxy_transport_exception(error)
+        ):
+            return "proxy_transport"
+        if stage in (STAGE_BROWSER_START, STAGE_PAGE_OPEN):
+            return "browser"
+        if stage in (STAGE_EMAIL_SUBMIT, STAGE_CODE_WAIT, STAGE_CODE_SUBMIT):
+            return "mail_or_verification"
+        return "registration"
+    if output is not None:
+        pool_warning = any(
+            isinstance(state, dict) and state.get("enabled") and not state.get("ok")
+            for state in output.pools.values()
+        )
+        cpa_warning = bool(
+            output.cpa and not output.cpa.get("skipped")
+            and (
+                not output.cpa.get("ok") or output.cpa.get("warning")
+                or output.cpa.get("partial") or output.cpa.get("cpa_copy_error")
+            )
+        )
+        if (
+            pool_warning or cpa_warning or output.legacy_export_error
+            or output.status_persist_error
+        ):
+            return "postprocess"
+    return ""
+
+
+def _notify_attempt(callbacks, slot_index, attempt_number, started_at, account, output, status, error, ops):
+    callback = getattr(callbacks, "record_attempt", None)
+    if not callable(callback):
+        return
+
+    stage = current_registration_stage()
+    message = str(error or "")
+    error_type = type(error).__name__ if error is not None else ""
+    if error is None and output is not None:
+        warnings = [
+            (output.save_error, "AccountPersistenceError"),
+            (output.legacy_export_error, "LegacyExportError"),
+            (output.status_persist_error, "IntegrationStatusPersistenceError"),
+        ]
+        for detail, kind in warnings:
+            if detail:
+                error_type = kind
+                message = str(detail)
+                break
+
+    trace = ""
+    if error is not None:
+        trace = "".join(
+            traceback.format_exception(type(error), error, error.__traceback__)
+        )
+
+    if account is not None:
+        for secret in (getattr(account, "password", ""), getattr(account, "sso", "")):
+            if secret:
+                message = message.replace(str(secret), "[REDACTED]")
+                trace = trace.replace(str(secret), "[REDACTED]")
+
+    failure_type = _attempt_failure_type(status, error, stage, output)
+    screenshot_path = ""
+    capture = getattr(ops, "capture_failure_diagnostics", None)
+    if status in ("retrying", "failed", "uncertain", "rejected") and callable(capture):
+        try:
+            screenshot_path = str(capture({
+                "slot_index": slot_index,
+                "attempt_number": attempt_number,
+                "worker_key": threading.current_thread().name,
+                "stage": stage,
+                "status": status,
+                "error_type": error_type,
+            }) or "")
+        except Exception as exc:
+            callbacks.log("[Debug] 失败截图捕获异常: %s" % type(exc).__name__)
+
+    try:
+        callback({
+            "slot_index": slot_index,
+            "attempt_number": attempt_number,
+            "worker_key": threading.current_thread().name,
+            "stage": stage,
+            "status": status,
+            "account_id": getattr(output, "account_id", None),
+            "error_type": error_type,
+            "error_message": message[:500],
+            "traceback": trace[:8000],
+            "failure_type": failure_type,
+            "screenshot_path": screenshot_path,
+            "started_at": started_at,
+            "finished_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        })
+    except Exception as exc:
+        callbacks.log("[!] 注册尝试状态写入 SQLite 失败: %s" % exc)
 
 
 def _run_cleanup_safely(ops, callbacks, reason):
@@ -310,7 +489,13 @@ def _record_success(result, settings, callbacks, ops, account, output, last_clea
     else:
         result.fail_count += 1; result.registered_unsaved_count += 1; callbacks.log(f"[-] 注册成功但持久化未完成: {account.email}")
     pool_warning = any(isinstance(state, dict) and state.get("enabled") and not state.get("ok") for state in output.pools.values())
-    cpa_warning = bool(output.cpa and not output.cpa.get("skipped") and (not output.cpa.get("ok") or output.cpa.get("warning") or output.cpa.get("cpa_copy_error")))
+    cpa_warning = bool(
+        output.cpa and not output.cpa.get("skipped")
+        and (
+            not output.cpa.get("ok") or output.cpa.get("warning")
+            or output.cpa.get("partial") or output.cpa.get("cpa_copy_error")
+        )
+    ) or bool(output.legacy_export_error) or bool(output.status_persist_error)
     if pool_warning or cpa_warning: result.postprocess_warning_count += 1
     return last_cleanup_success_count
 
@@ -341,8 +526,16 @@ def _run_batch_managed(settings, callbacks, observer, ops):
     try:
         while result.processed_count < settings.count:
             if callbacks.cancelled(): result.cancelled = True; break
-            slot_index = result.processed_count + 1; attempt_index = retry_count_for_slot + 1
-            account = None; output = None; continue_batch = True; transport_error = None; slot_success = False
+            slot_index = result.processed_count + 1
+            attempt_index = retry_count_for_slot + 1
+            attempt_started_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            attempt_status = "failed"
+            attempt_error = None
+            account = None
+            output = None
+            continue_batch = True
+            transport_error = None
+            slot_success = False
             _set_registration_stage(STAGE_LEASE_ACQUIRE)
             try:
                 begin_registration_slot(slot_index=slot_index, attempt_index=attempt_index, worker_key=threading.current_thread().name, log=callbacks.log, cancel_callback=callbacks.cancelled)
@@ -355,6 +548,7 @@ def _run_batch_managed(settings, callbacks, observer, ops):
                 callbacks.log(f"--- 开始第 {slot_index}/{settings.count} 个账号 ---")
                 account = register_one_account(callbacks, ops, enable_nsfw=settings.enable_nsfw, max_mail_retry=settings.max_mail_retry)
                 output = persist_account_result(account, callbacks, ops)
+                attempt_status = "succeeded" if output.saved else "registered_unsaved"
                 feedback_kind, feedback_error = _feedback_from_output(account, output); lease = current_proxy_lease()
                 if lease is not None and feedback_kind == "hard_transport":
                     transport_error = ProxyTransportError(feedback_error or "postprocess proxy failure")
@@ -366,57 +560,103 @@ def _run_batch_managed(settings, callbacks, observer, ops):
                     callbacks.log("[Debug] 后处理属于本地兼容/配置错误，不计入代理传输健康度")
                 slot_success = bool(account and account.ok); retry_count_for_slot = 0
                 last_cleanup_success_count = _record_success(result, settings, callbacks, ops, account, output, last_cleanup_success_count)
-            except ProxyAcquireCancelled:
+            except ProxyAcquireCancelled as exc:
+                attempt_status = "cancelled"; attempt_error = exc
                 result.cancelled = True; callbacks.log("[!] 已在等待代理租约时停止"); continue_batch = False
-            except ops.cancelled_exception:
+            except ops.cancelled_exception as exc:
+                attempt_status = "cancelled"; attempt_error = exc
                 result.cancelled = True; callbacks.log("[!] 注册被停止"); continue_batch = False
             except ops.retry_exception as exc:
-                stage = current_registration_stage(); disposition = registration_retry_disposition(stage, exc)
+                attempt_error = exc
+                stage = current_registration_stage()
+                disposition = registration_retry_disposition(stage, exc)
+                if disposition == FATAL:
+                    attempt_status = "failed"
+                    raise
                 if disposition != SAFE_NEW_LEASE:
-                    _record_uncertain(result, callbacks, stage, exc); retry_count_for_slot = 0
+                    attempt_status = "uncertain"
+                    _record_uncertain(result, callbacks, stage, exc)
+                    retry_count_for_slot = 0
                 else:
+                    attempt_status = "retrying"
                     retry_count_for_slot += 1
-                    if retry_count_for_slot <= settings.max_slot_retry: callbacks.log(f"[!] 当前账号流程卡住，安全重试第 {retry_count_for_slot}/{settings.max_slot_retry} 次: {exc}")
+                    if retry_count_for_slot <= settings.max_slot_retry:
+                        callbacks.log(
+                            f"[!] 当前账号流程卡住，安全重试第 "
+                            f"{retry_count_for_slot}/{settings.max_slot_retry} 次: {exc}"
+                        )
                     else:
-                        result.fail_count += 1; result.processed_count += 1; retry_count_for_slot = 0; callbacks.log(f"[-] 当前账号已达到最大重试次数，跳过: {exc}")
+                        attempt_status = "failed"
+                        result.fail_count += 1
+                        result.processed_count += 1
+                        retry_count_for_slot = 0
+                        callbacks.log(f"[-] 当前账号已达到最大重试次数，跳过: {exc}")
             except EmailSignupUnavailable as exc:
+                attempt_status = "rejected"; attempt_error = exc
                 result.fail_count += 1; result.processed_count += 1; retry_count_for_slot = 0
                 callbacks.log(f"[-] 邮箱注册被 xAI 页面明确拒绝，停止本批次以免反复提交: {exc}")
                 if callbacks.stop_all is not None:
                     callbacks.stop_all()
                 continue_batch = False
             except RegistrationRiskDenied as exc:
+                attempt_status = "rejected"; attempt_error = exc
                 result.fail_count += 1; result.processed_count += 1; retry_count_for_slot = 0
                 callbacks.log(f"[-] 注册风控拒绝，已跳过入库: {exc}")
             except Exception as exc:
+                attempt_error = exc
                 has_lease = current_proxy_lease() is not None
-                proxy_failure = isinstance(exc, ProxyPoolError) or (has_lease and is_proxy_transport_exception(exc))
-                stage = current_registration_stage(); disposition = registration_retry_disposition(stage, exc)
-                if proxy_failure and has_lease and is_proxy_transport_exception(exc): transport_error = exc
+                proxy_failure = isinstance(exc, ProxyPoolError) or (
+                    has_lease and is_proxy_transport_exception(exc)
+                )
+                stage = current_registration_stage()
+                disposition = registration_retry_disposition(stage, exc)
+                if proxy_failure and has_lease and is_proxy_transport_exception(exc):
+                    transport_error = exc
+
                 if disposition == OUTCOME_UNCERTAIN:
-                    _record_uncertain(result, callbacks, stage, exc); retry_count_for_slot = 0
-                elif proxy_failure and disposition == SAFE_NEW_LEASE:
-                    retry_count_for_slot += 1
-                    if retry_count_for_slot <= settings.max_slot_retry:
-                        callbacks.log(f"[!] 当前账号代理在安全阶段不可用，释放租约并重试 {retry_count_for_slot}/{settings.max_slot_retry}: {exc}")
-                    else:
-                        result.fail_count += 1; result.processed_count += 1; retry_count_for_slot = 0; callbacks.log(f"[-] 当前账号代理重试达到上限，跳过: {exc}")
-                elif disposition == SAFE_NEW_LEASE and isinstance(exc, RecoverablePreSubmitError):
-                    retry_count_for_slot += 1
-                    if retry_count_for_slot <= settings.max_slot_retry:
-                        callbacks.log(f"[!] 提交前页面暂时不可用，重试 {retry_count_for_slot}/{settings.max_slot_retry}: {exc}")
-                    else:
-                        result.fail_count += 1; result.processed_count += 1; retry_count_for_slot = 0
-                        callbacks.log(f"[-] 提交前页面重试达到上限，跳过: {exc}")
+                    attempt_status = "uncertain"
+                    _record_uncertain(result, callbacks, stage, exc)
+                    retry_count_for_slot = 0
                 elif disposition == SAFE_NEW_LEASE:
+                    attempt_status = "retrying"
+                    retry_count_for_slot += 1
+                    if retry_count_for_slot <= settings.max_slot_retry:
+                        if proxy_failure:
+                            callbacks.log(
+                                f"[!] 当前账号代理在安全阶段不可用，释放租约并重试 "
+                                f"{retry_count_for_slot}/{settings.max_slot_retry}: {exc}"
+                            )
+                        else:
+                            callbacks.log(
+                                f"[!] {stage} 阶段在注册信息提交前失败，安全重试 "
+                                f"{retry_count_for_slot}/{settings.max_slot_retry}: {exc}"
+                            )
+                    else:
+                        attempt_status = "failed"
+                        result.fail_count += 1
+                        result.processed_count += 1
+                        retry_count_for_slot = 0
+                        callbacks.log(f"[-] 提交前安全重试达到上限，跳过当前账号: {exc}")
+                elif disposition == FATAL:
+                    attempt_status = "failed"
                     raise
                 else:
-                    result.fail_count += 1; result.processed_count += 1; retry_count_for_slot = 0; callbacks.log(f"[-] 注册失败: {exc}")
+                    attempt_status = "failed"
+                    result.fail_count += 1
+                    result.processed_count += 1
+                    retry_count_for_slot = 0
+                    callbacks.log(f"[-] 注册失败: {exc}")
             finally:
                 try:
                     end_registration_slot(success=slot_success, transport_error=transport_error)
                 except Exception as exc:
                     callbacks.log(f"[Debug] 代理租约释放失败: {exc}")
+                if output is not None:
+                    attempt_status = "succeeded" if output.saved else "registered_unsaved"
+                _notify_attempt(
+                    callbacks, slot_index, attempt_index, attempt_started_at,
+                    account, output, attempt_status, attempt_error, ops,
+                )
                 _notify_observer(observer, result, account, output, callbacks)
             if not continue_batch or result.cancelled: break
     finally:

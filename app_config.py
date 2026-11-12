@@ -4,7 +4,10 @@ import os
 import tempfile
 import urllib.parse
 
-CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+CONFIG_FILE = os.path.abspath(os.path.expanduser(
+    os.environ.get("GROK_REGISTER_CONFIG_FILE")
+    or os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+))
 
 DEFAULT_CONFIG = {
     "duckmail_api_key": "",
@@ -20,6 +23,7 @@ DEFAULT_CONFIG = {
     "cloudmail_domains": "",
     "cloudmail_path_messages": "/api/public/emailList",
     "outlook_accounts_file": "./output/mailboxes/outlook-accounts.txt",
+    "database_path": "./data/grok-register.sqlite3",
     "proxy_mode": "auto",
     "proxy": "",
     "proxy_fallback": "none",
@@ -148,7 +152,7 @@ def validate_config_structure(raw):
     cfg["cpa_oidc_poll_timeout_sec"] = _require_int(cfg, "cpa_oidc_poll_timeout_sec", 3, 120)
     string_keys = tuple(key for key, value in DEFAULT_CONFIG.items() if isinstance(value, str))
     path_keys = {
-        "grok2api_local_token_file", "api_reverse_tools", "cpa_auth_dir", "cpa_hotload_dir",
+        "database_path", "grok2api_local_token_file", "api_reverse_tools", "cpa_auth_dir", "cpa_hotload_dir",
         "proxy_pool_file", "proxy_singbox_path", "proxy_pool_state_file",
         "sso_risk_rejected_file", "outlook_accounts_file",
     }

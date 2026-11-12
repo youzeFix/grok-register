@@ -32,6 +32,11 @@ def _mark_registration_stage(stage):
     return _set_registration_stage(stage)
 
 
+def _is_non_retryable_browser_error(error):
+    from registration_flow import _is_non_retryable_pre_submit_error
+    return _is_non_retryable_pre_submit_error(error)
+
+
 def _managed_proxy_mode():
     try:
         return str(config.get("proxy_mode", "auto") or "auto").strip().lower() in ("single", "pool")
@@ -62,7 +67,7 @@ _RUNTIME_DEPENDENCIES = (
     "config", "get_configured_proxy", "get_proxies", "prepare_browser_proxy",
     "create_browser_options", "page_has_proxy_error", "is_proxy_connection_error",
     "sleep_with_cancel", "raise_if_cancelled", "AccountRetryNeeded",
-    "get_email_and_token", "get_oai_code", "get_user_agent",
+    "get_email_and_token", "release_email_lease", "get_oai_code", "get_user_agent",
 )
 
 
@@ -242,6 +247,7 @@ def stop_browser_proxy_bridge():
 
 def start_browser(log_callback=None, use_proxy=True):
     global browser, page, browser_proxy_bridge, browser_started_with_proxy
+    _mark_registration_stage("browser_start")
     last_exc = None
     proxy_enabled = bool(use_proxy and get_configured_proxy())
     for attempt in range(1, 5):
@@ -280,10 +286,15 @@ def start_browser(log_callback=None, use_proxy=True):
             page = None
             browser_proxy_bridge = None
             browser_started_with_proxy = False
+            if _is_non_retryable_browser_error(exc):
+                raise
             time.sleep(min(1.5 * attempt, 4))
     if _managed_proxy_mode() and is_proxy_connection_error(last_exc):
         raise ProxyTransportError("Chromium 通过当前代理启动失败: %s" % safe_proxy_error_text(last_exc)) from last_exc
-    raise Exception(f"浏览器启动失败，已重试4次: {last_exc}")
+    from registration_flow import RecoverablePreSubmitError
+    raise RecoverablePreSubmitError(
+        f"浏览器启动失败，已重试4次: {last_exc}"
+    ) from last_exc
 
 def stop_browser():
     global browser, page, browser_started_with_proxy
@@ -411,12 +422,14 @@ return candidates[0].text || true;
         page_html = page.html[:500] if page else "no page"
         log_callback(f"[Debug] 页面内容片段: {page_html}")
 
-    raise Exception("未找到「使用邮箱注册」按钮")
+    from registration_flow import RecoverablePreSubmitError
+    raise RecoverablePreSubmitError("未找到「使用邮箱注册」按钮")
 
 def open_signup_page(log_callback=None, cancel_callback=None):
     global browser, page
     raise_if_cancelled(cancel_callback)
     if browser is None:
+        _mark_registration_stage("browser_start")
         start_browser(log_callback=log_callback)
         if log_callback:
             log_callback("[*] 浏览器已启动")
@@ -432,29 +445,59 @@ def open_signup_page(log_callback=None, cancel_callback=None):
             page = browser.new_tab(SIGNUP_URL)
         page.wait.doc_loaded()
 
-    try:
+    def _open_signup_page():
+        _mark_registration_stage("page_open")
         _open_with_current_browser()
-    except Exception as e:
+
+    try:
+        _open_signup_page()
+    except Exception as exc:
+        if _is_non_retryable_browser_error(exc) or isinstance(exc, ProxyTransportError):
+            raise
         if browser_started_with_proxy and get_configured_proxy():
             if _managed_proxy_mode():
-                raise ProxyTransportError("当前代理访问注册页失败: %s" % safe_proxy_error_text(e)) from e
+                raise ProxyTransportError(
+                    "当前代理访问注册页失败: %s" % safe_proxy_error_text(exc)
+                ) from exc
             if log_callback:
-                log_callback(f"[!] 浏览器代理访问注册页失败，自动回退直连: {e}")
-            restart_browser(log_callback=log_callback, use_proxy=False)
-            _open_with_current_browser()
+                log_callback(f"[!] 浏览器代理访问注册页失败，自动回退直连: {exc}")
+            try:
+                restart_browser(log_callback=log_callback, use_proxy=False)
+                _open_signup_page()
+            except Exception as fallback_exc:
+                if (
+                    _is_non_retryable_browser_error(fallback_exc)
+                    or isinstance(fallback_exc, ProxyTransportError)
+                ):
+                    raise
+                from registration_flow import RecoverablePreSubmitError
+                raise RecoverablePreSubmitError(
+                    f"注册页导航暂时失败（直连回退）: {fallback_exc}"
+                ) from fallback_exc
         else:
             from registration_flow import RecoverablePreSubmitError
-            if isinstance(e, (ContextLostError, PageDisconnectedError, TimeoutError)):
-                raise RecoverablePreSubmitError(f"注册页导航暂时失败: {e}") from e
-            raise
+            raise RecoverablePreSubmitError(
+                f"注册页导航暂时失败: {exc}"
+            ) from exc
 
     if browser_started_with_proxy and page_has_proxy_error(page):
         if _managed_proxy_mode():
             raise ProxyTransportError("Chromium 页面显示代理连接错误")
         if log_callback:
             log_callback("[!] 浏览器页面显示代理错误，自动回退直连")
-        restart_browser(log_callback=log_callback, use_proxy=False)
-        _open_with_current_browser()
+        try:
+            restart_browser(log_callback=log_callback, use_proxy=False)
+            _open_signup_page()
+        except Exception as exc:
+            if (
+                _is_non_retryable_browser_error(exc)
+                or isinstance(exc, ProxyTransportError)
+            ):
+                raise
+            from registration_flow import RecoverablePreSubmitError
+            raise RecoverablePreSubmitError(
+                f"注册页导航暂时失败（代理回退）: {exc}"
+            ) from exc
 
     sleep_with_cancel(2, cancel_callback)
     if log_callback:
@@ -479,17 +522,46 @@ return !!(givenInput && familyInput && passwordInput);
     except Exception:
         return False
 
+def _release_email_lease(dev_token, email, log_callback=None):
+    release = globals().get("release_email_lease")
+    if not callable(release) or not dev_token:
+        return
+    try:
+        release(dev_token, email)
+    except Exception as exc:
+        if log_callback:
+            log_callback("[!] 邮箱租约释放失败: %s" % type(exc).__name__)
+
+
 def fill_email_and_submit(timeout=45, log_callback=None, cancel_callback=None, on_mail_created=None):
+    _mark_registration_stage("page_open")
     raise_if_cancelled(cancel_callback)
+    email = dev_token = ""
     try:
         email, dev_token = get_email_and_token()
         if not email or not dev_token:
             raise RuntimeError("邮箱服务未返回完整凭据")
     except Exception as exc:
-        # No browser form was submitted: this slot can be retried safely.
+        if dev_token:
+            _release_email_lease(dev_token, email, log_callback)
         raise_if_cancelled(cancel_callback)
+        if _is_non_retryable_browser_error(exc):
+            raise
         from registration_flow import RecoverablePreSubmitError
         raise RecoverablePreSubmitError(f"提交前创建邮箱失败: {exc}") from exc
+
+    try:
+        return _fill_email_form(
+            email, dev_token, timeout=timeout, log_callback=log_callback,
+            cancel_callback=cancel_callback, on_mail_created=on_mail_created,
+        )
+    finally:
+        from registration_flow import current_registration_stage
+        if current_registration_stage() != "email_submit":
+            _release_email_lease(dev_token, email, log_callback)
+
+
+def _fill_email_form(email, dev_token, timeout=45, log_callback=None, cancel_callback=None, on_mail_created=None):
     if log_callback:
         log_callback(f"[*] 已创建邮箱: {email}")
     if on_mail_created is not None:
@@ -783,10 +855,12 @@ return 'enter';
         inputs = " | ".join(last_snapshot.get("inputs", [])[:6])
         buttons = " | ".join(last_snapshot.get("buttons", [])[:8])
         url = last_snapshot.get("url", page.url if page else "")
-        raise Exception(
+        from registration_flow import RecoverablePreSubmitError
+        raise RecoverablePreSubmitError(
             f"未找到邮箱输入框或注册按钮，最后页面: url={url}; inputs={inputs or 'none'}; buttons={buttons or 'none'}"
         )
-    raise Exception("未找到邮箱输入框或注册按钮")
+    from registration_flow import RecoverablePreSubmitError
+    raise RecoverablePreSubmitError("未找到邮箱输入框或注册按钮")
 
 def fill_code_and_submit(email, dev_token, timeout=180, transition_timeout=15, log_callback=None, cancel_callback=None):
     from registration_flow import VerificationCodeUnavailable

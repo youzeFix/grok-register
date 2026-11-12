@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import collections
 import datetime
+import os
 import threading
 import time
 from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from starlette.concurrency import run_in_threadpool
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
@@ -18,6 +19,8 @@ import grok_register_ttk as engine
 
 ROOT = Path(__file__).resolve().parent.parent
 INDEX_HTML = Path(__file__).resolve().parent / "index.html"
+FRONTEND_DIST = ROOT / "frontend" / "dist"
+FRONTEND_ASSETS = FRONTEND_DIST / "assets"
 PROXY_POOL_JS = Path(__file__).resolve().parent / "proxy-pool.js"
 PROXY_POOL_CSS = Path(__file__).resolve().parent / "proxy-pool.css"
 OUTLOOK_MAILBOX_JS = Path(__file__).resolve().parent / "outlook-mailbox.js"
@@ -53,6 +56,54 @@ _job_state = {
 _log_lock = threading.Lock()
 _log_seq = 0
 _logs = collections.deque(maxlen=LOG_LIMIT)
+
+_database_lock = threading.Lock()
+_database_cache = {}
+_reauth_manager = None
+
+
+def _get_database():
+    from storage.database import Database
+    from storage.legacy_import import import_legacy_directory
+
+    config = _load_config_if_idle()
+    path = str(Path(config.get("database_path") or "./data/grok-register.sqlite3").expanduser().resolve())
+    with _database_lock:
+        database = _database_cache.get(path)
+        if database is None:
+            database = Database(path)
+            _database_cache[path] = database
+        imported = []
+        for directory in dict.fromkeys((ROOT, _output_directory())):
+            if directory.is_dir():
+                imported.extend(import_legacy_directory(database, directory, ""))
+    for source, summary in imported:
+        _append_log(
+            "[*] 读取账号列表时导入旧文件: %s | 新增 %s | 重复 %s | 格式错误 %s"
+            % (Path(source).name, summary.imported, summary.duplicates, summary.malformed)
+        )
+    return database
+
+
+def _normalize_date_filter(value: str, end_of_day: bool = False) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        if len(raw) == 10:
+            parsed = datetime.datetime.combine(
+                datetime.date.fromisoformat(raw),
+                datetime.time.max if end_of_day else datetime.time.min,
+                tzinfo=datetime.timezone.utc,
+            )
+        else:
+            parsed = datetime.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+            parsed = parsed.astimezone(datetime.timezone.utc)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="日期必须使用 ISO 8601 格式") from exc
+    return parsed.isoformat(timespec="microseconds")
 
 
 def _append_log(message: str) -> None:
@@ -97,9 +148,16 @@ def _load_config_if_idle() -> dict[str, Any]:
         return dict(engine.config)
 
 
+def _output_directory() -> Path:
+    configured = str(os.environ.get("GROK_REGISTER_OUTPUT_DIR") or "").strip()
+    return Path(configured).expanduser().resolve() if configured else ROOT
+
+
 def _new_accounts_file() -> str:
+    directory = _output_directory()
+    directory.mkdir(parents=True, exist_ok=True)
     stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    return str(ROOT / ("accounts_%s.txt" % stamp))
+    return str(directory / ("accounts_%s.txt" % stamp))
 
 
 def _update_progress(batch: Any) -> None:
@@ -140,6 +198,10 @@ def _run_job(count: int, controller: Any, accounts_file: str) -> None:
 
 @app.get("/", include_in_schema=False)
 def index():
+    react_index = FRONTEND_DIST / "index.html"
+    if react_index.is_file():
+        return FileResponse(react_index, headers={"Cache-Control": "no-store"})
+
     html = INDEX_HTML.read_text(encoding="utf-8")
     if PROXY_POOL_CSS.is_file():
         html = html.replace("</head>", '<link rel="stylesheet" href="/proxy-pool.css">\n</head>', 1)
@@ -148,6 +210,19 @@ def index():
     if OUTLOOK_MAILBOX_JS.is_file():
         html = html.replace("</body>", '<script src="/outlook-mailbox.js"></script>\n</body>', 1)
     return HTMLResponse(html, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/assets/{asset_name}", include_in_schema=False)
+def frontend_asset(asset_name: str):
+    if Path(asset_name).name != asset_name:
+        raise HTTPException(status_code=404, detail="资源不存在")
+    asset = FRONTEND_ASSETS / asset_name
+    if not asset.is_file():
+        raise HTTPException(status_code=404, detail="资源不存在")
+    return FileResponse(
+        asset,
+        headers={"Cache-Control": "public, max-age=31536000, immutable"},
+    )
 
 
 @app.get("/proxy-pool.js", include_in_schema=False)
@@ -189,6 +264,34 @@ def _require_local_origin(request: Request) -> None:
 @app.get("/health")
 def health():
     return {"ok": True}
+
+
+@app.post("/api/health-check")
+async def dependency_health_check(request: Request):
+    _require_local_origin(request)
+    payload = await request.json()
+    if not isinstance(payload, dict) or type(payload.get("connectivity", False)) is not bool:
+        raise HTTPException(status_code=400, detail="connectivity 必须是布尔值")
+
+    kind = "dependency_health_check"
+    _begin_maintenance(kind)
+    try:
+        engine.load_config()
+        cfg = engine.validate_config_structure(dict(engine.config))
+        from preflight import run_health_checks
+        result = await run_in_threadpool(
+            run_health_checks, cfg, payload.get("connectivity", False), _append_log
+        )
+    except (engine.ConfigError, ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    finally:
+        _end_maintenance(kind)
+
+    _append_log(
+        "[*] 依赖健康检查完成: Result: %s | errors=%s warnings=%s"
+        % (result["result"], result["error_count"], result["warning_count"])
+    )
+    return JSONResponse(content=result, headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/config")
@@ -389,6 +492,252 @@ def logs(after: int = Query(default=0, ge=0)):
         entries = [dict(item) for item in _logs if int(item["seq"]) > int(after)]
         latest = int(_log_seq)
     return {"ok": True, "latest": latest, "entries": entries}
+
+
+@app.get("/api/accounts")
+def list_accounts(
+    request: Request,
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    search: str = Query(default=""),
+    registration_status: str = Query(default=""),
+    authorization_status: str = Query(default=""),
+    email_provider: str = Query(default=""),
+    registration_run_id: Optional[int] = Query(default=None, ge=1),
+    date_from: str = Query(default=""),
+    date_to: str = Query(default=""),
+    cpa_status: str = Query(default=""),
+    grok2api_local_status: str = Query(default=""),
+    grok2api_remote_status: str = Query(default=""),
+):
+    _require_local_origin(request)
+    database = _get_database()
+    result = database.list_accounts(
+        limit=limit,
+        offset=offset,
+        search=search,
+        registration_status=registration_status,
+        authorization_status=authorization_status,
+        email_provider=email_provider,
+        registration_run_id=registration_run_id,
+        date_from=_normalize_date_filter(date_from),
+        date_to=_normalize_date_filter(date_to, end_of_day=True),
+        cpa_status=cpa_status,
+        grok2api_local_status=grok2api_local_status,
+        grok2api_remote_status=grok2api_remote_status,
+    )
+    return JSONResponse(
+        content={"ok": True, **result, "limit": limit, "offset": offset},
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+def _require_account_edits_idle():
+    with _job_lock:
+        if _job_state["running"] or _maintenance_state is not None:
+            raise HTTPException(status_code=409, detail="任务运行期间不能删除账号")
+
+
+@app.delete("/api/accounts")
+async def delete_accounts(request: Request):
+    _require_local_origin(request)
+    _require_account_edits_idle()
+    payload = await request.json()
+    account_ids = payload.get("ids") if isinstance(payload, dict) else None
+    if not isinstance(account_ids, list) or not account_ids:
+        raise HTTPException(status_code=400, detail="请提供非空账号 ID 列表")
+    if any(type(value) is not int or value < 1 for value in account_ids):
+        raise HTTPException(status_code=400, detail="账号 ID 必须是正整数")
+    ids = account_ids
+    deleted = _get_database().delete_accounts(ids)
+    return {"ok": True, "deleted_count": deleted, "legacy_files_unchanged": True}
+
+
+@app.get("/api/accounts/{account_id}")
+def get_account(account_id: int, request: Request):
+    _require_local_origin(request)
+    account = _get_database().get_account(account_id)
+    if account is None:
+        raise HTTPException(status_code=404, detail="账号不存在")
+    return JSONResponse(
+        content={"ok": True, "account": account},
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.delete("/api/accounts/{account_id}")
+def delete_account(account_id: int, request: Request):
+    _require_local_origin(request)
+    _require_account_edits_idle()
+    if not _get_database().delete_account(account_id):
+        raise HTTPException(status_code=404, detail="账号不存在")
+    return {"ok": True, "deleted": True, "legacy_files_unchanged": True}
+
+
+@app.post("/api/accounts/export")
+async def export_accounts(request: Request):
+    _require_local_origin(request)
+    payload = await request.json()
+    account_ids = payload.get("ids") if isinstance(payload, dict) else None
+    if not isinstance(account_ids, list) or not account_ids:
+        raise HTTPException(status_code=400, detail="请提供非空账号 ID 列表")
+    if any(type(value) is not int or value < 1 for value in account_ids):
+        raise HTTPException(status_code=400, detail="账号 ID 必须是正整数")
+    ids = account_ids
+    unique_ids = list(dict.fromkeys(ids))
+    rows = _get_database().export_accounts(unique_ids)
+    if len(rows) != len(unique_ids):
+        raise HTTPException(status_code=404, detail="部分账号不存在")
+    body = "".join(
+        "%s----%s----%s\n" % (row["email"], row["password"], row["sso"])
+        for row in rows
+    )
+    return Response(
+        content=body,
+        media_type="text/plain; charset=utf-8",
+        headers={
+            "Content-Disposition": 'attachment; filename="accounts-export.txt"',
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+@app.get("/api/stats")
+def account_stats(request: Request):
+    _require_local_origin(request)
+    return JSONResponse(
+        content={"ok": True, **_get_database().account_stats()},
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.get("/api/jobs/history")
+def registration_history(
+    request: Request,
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+):
+    _require_local_origin(request)
+    return JSONResponse(
+        content={
+            "ok": True, **_get_database().list_registration_runs(limit, offset),
+            "limit": limit, "offset": offset,
+        },
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.get("/api/jobs/history/{run_id}/attempts")
+def registration_attempt_history(
+    run_id: int,
+    request: Request,
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+):
+    _require_local_origin(request)
+    result = _get_database().list_registration_attempts(run_id, limit, offset)
+    if result is None:
+        raise HTTPException(status_code=404, detail="注册批次不存在")
+    return JSONResponse(
+        content={"ok": True, **result, "limit": limit, "offset": offset},
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.get("/api/jobs/history/{run_id}/attempts/{attempt_id}/screenshot")
+def registration_attempt_screenshot(run_id: int, attempt_id: int, request: Request):
+    _require_local_origin(request)
+    database = _get_database()
+    attempt = database.get_registration_attempt(run_id, attempt_id)
+    if attempt is None or not attempt["screenshot_path"]:
+        raise HTTPException(status_code=404, detail="失败截图不存在")
+
+    diagnostics_dir = (
+        Path(database.path).expanduser().resolve().parent / "diagnostics" / "registration"
+    )
+    screenshot = Path(attempt["screenshot_path"]).resolve()
+    try:
+        screenshot.relative_to(diagnostics_dir.resolve())
+    except ValueError:
+        raise HTTPException(status_code=404, detail="失败截图不存在")
+    if not screenshot.is_file():
+        raise HTTPException(status_code=404, detail="失败截图不存在")
+    return FileResponse(
+        screenshot,
+        media_type="image/png",
+        headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
+    )
+
+
+@app.post("/api/reauth/start")
+async def start_reauthentication(request: Request):
+    _require_local_origin(request)
+    payload = await request.json()
+    ids = payload.get("ids") if isinstance(payload, dict) else None
+    if not isinstance(ids, list) or not ids or len(ids) > 200:
+        raise HTTPException(status_code=400, detail="请选择 1-200 个账号")
+    if any(type(value) is not int or value < 1 for value in ids):
+        raise HTTPException(status_code=400, detail="账号 ID 必须是正整数")
+
+    global _reauth_manager
+    kind = "account_reauthentication"
+    _begin_maintenance(kind)
+    try:
+        engine.load_config()
+        from reauth_jobs import ReauthManager, browser_login, refresh_integrations
+
+        manager = ReauthManager(
+            _get_database(), browser_login, refresh_integrations,
+            _output_directory(), log=_append_log, on_finish=lambda: _end_maintenance(kind),
+        )
+        job_id = manager.start(ids)
+        _reauth_manager = manager
+        return {"ok": True, "job_id": job_id}
+    except (ValueError, LookupError, engine.ConfigError) as exc:
+        _end_maintenance(kind)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception:
+        _end_maintenance(kind)
+        raise
+
+
+@app.get("/api/reauth/status")
+def reauthentication_status(request: Request):
+    _require_local_origin(request)
+    manager = _reauth_manager
+    return JSONResponse(
+        content={"ok": True, **(manager.status() if manager else {"running": False, "job": None})},
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.post("/api/reauth/stop")
+def stop_reauthentication(request: Request):
+    _require_local_origin(request)
+    manager = _reauth_manager
+    return {"ok": True, "stopped": manager.stop() if manager else False}
+
+
+@app.get("/api/reauth/history")
+def reauthentication_history(
+    request: Request,
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+):
+    _require_local_origin(request)
+    return JSONResponse(
+        content={"ok": True, **_get_database().list_jobs("reauthentication", limit, offset)},
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.get("/api/reauth/jobs/{job_id}")
+def reauthentication_job(job_id: int, request: Request):
+    _require_local_origin(request)
+    job = _get_database().get_job(job_id)
+    if job is None or job["job_type"] != "reauthentication":
+        raise HTTPException(status_code=404, detail="重新登录任务不存在")
+    return JSONResponse(content={"ok": True, "job": job}, headers={"Cache-Control": "no-store"})
 
 
 @app.post("/api/start")

@@ -38,6 +38,7 @@ Grok Register 是基于 Python 和 Chromium 的注册自动化工具，提供 GU
 
 - [项目功能](#项目功能)
 - [快速开始](#快速开始)
+- [Docker 部署](#docker-部署)
 - [运行方式](#运行方式)
 - [配置说明](#配置说明)
 - [代理与代理池](#代理与代理池)
@@ -68,14 +69,14 @@ Grok Register 是基于 Python 和 Chromium 的注册自动化工具，提供 GU
   </tr>
   <tr>
     <td valign="top">
-      <p><sub>需要稳定的住宅 IP？试试 <a href="https://www.ipwo.net/?ref=githubgrokregister">IPWO</a>住宅代理。</sub></p>
+      <p><sub>需要稳定的住宅IP？试试<a href="https://www.ipwo.net/?ref=githubgrokregister">IPWO</a>住宅代理。</sub></p>
       <p><sub>
         覆盖 195+ 国家和地区<br>
         真实住宅 IP 资源<br>
-        灵活的 IP 轮换<br>
-        支持 HTTP / HTTPS / SOCKS5
+        支持 HTTP / HTTPS / SOCKS5<br>
+        静态 IP 低至 9.9 元/条/月<br>
+        适用于自动化注册、账号管理、数据采集及跨境业务场景，可与浏览器自动化工具和代理池灵活搭配。免费试用，折扣码：<strong><code>0205</code></strong> 即可减免 10%。
       </sub></p>
-      <p><sub>适用于自动化注册、账号管理、数据采集及跨境业务场景，可与浏览器自动化工具和代理池灵活搭配。免费试用，折扣码：<strong><code>0205</code></strong></sub></p>
     </td>
     <td valign="top">
       <p><sub>需要每个账号一个固定住宅IP？试试<a href="https://proxylane.dev/?utm_source=grok_register&amp;utm_medium=partnership&amp;utm_campaign=grok_register_sponsor_202610&amp;utm_content=github_readme">ProxyLane</a>住宅代理。</sub></p>
@@ -227,9 +228,13 @@ GUI：
 python grok_register_ttk.py
 ```
 
-WebUI：
+WebUI（React 前端需要 Node.js 22.12 或更高版本）：
 
 ```bash
+cd frontend
+npm install
+npm run build
+cd ..
 python -m pip install -r requirements-web.txt
 python -m web.server
 ```
@@ -242,11 +247,38 @@ http://127.0.0.1:8092
 
 > GUI、CLI 和 WebUI 共用同一个 `config.json` 和同一套注册逻辑。建议同一时间只使用一个入口启动任务。
 
+## Docker 部署
+
+项目提供 AMD64 Docker 镜像，包含 React WebUI、FastAPI 和 headless Chromium：
+
+```bash
+docker compose up -d --build
+docker compose logs -f app
+```
+
+访问 `http://127.0.0.1:8092`。首次启动会自动初始化持久化配置；后续可直接通过 WebUI 修改配置。
+
+也可以直接使用已发布的 GHCR 镜像，而不是本地构建：
+
+```bash
+export GROK_REGISTER_IMAGE=ghcr.io/aaronl725/grok-register:latest
+docker compose pull
+docker compose up -d --no-build
+```
+
+版本标签和自动发布流程见 [Docker 部署文档](docs/docker.md)。
+
+配置与运行数据保存在 Docker 命名卷中。普通的 `docker compose down` 不会删除数据；**不要执行 `docker compose down -v`，除非要清空配置和全部账号数据**。
+
+Docker 部署仅提供 WebUI，不提供 Tk 桌面 GUI；Chromium 使用 headless 模式。当前只验证 AMD64，尚未承诺 ARM64 原生支持。
+
+详细说明、数据备份和可选 sing-box 配置见[Docker 部署文档](docs/docker.md)。
+
 ## 运行方式
 
 ### WebUI（可选）
 
-启动命令见[快速开始](#快速开始)。WebUI 默认监听 `127.0.0.1:8092`，提供中英双语配置、开始/停止、批次统计、实时日志、代理池节点状态、订阅解析统计、重新加载和手动测试。
+启动命令见[快速开始](#快速开始)。WebUI 默认监听 `127.0.0.1:8092`，使用 React 19 + TypeScript 前端和 FastAPI 本地 API，提供中英双语配置、开始/停止、批次统计、实时日志、代理池节点状态、订阅解析统计、重新加载和手动测试。若尚未构建 `frontend/dist`，服务会暂时回退到旧版静态界面。
 
 ### GUI
 
@@ -271,6 +303,28 @@ CLI 读取 `config.json`，通过校验后提示：
 输入 `start` 才正式运行；按 `Ctrl+C` 可请求停止。
 
 > CLI 只是省略 Tk GUI，注册页面仍然会使用真实 Chromium / Chrome。
+
+### 依赖健康检查
+
+可以在 GUI / WebUI 中点击“静态依赖检查”或“联网依赖检查”，也可以通过 CLI 执行：
+
+```bash
+# 离线检查配置、浏览器依赖、本地文件和可选集成
+python grok_register_ttk.py check
+
+# 用户主动触发联网检查
+python grok_register_ttk.py check --connectivity
+```
+
+健康检查覆盖 Configuration、Browser Runtime、Proxy、Mailbox、CPA 和 Grok2API。必需依赖失败会显示 `Result: Needs attention`；CPA、Grok2API 等可选集成异常只显示 `WARN`，不会阻断整体 `Ready` 结果。静态检查不会联网；联网检查不会启动注册、创建邮箱或执行 CPA OAuth 授权。健康检查不会自动插入注册流程。
+
+详细说明见[依赖健康检查文档](docs/health-check.md)。
+
+### 已有账号重新认证
+
+SQLite 账号支持正常邮箱密码重新登录、SSO 更新、旧版 TXT 文件同步以及 CPA/Grok2API 授权恢复。React WebUI 现已提供账号筛选、详情、批量删除与导出、重新登录控制、注册历史和失败截图查看。
+
+详细说明见[重新认证与授权恢复](docs/reauthentication.md)。
 
 ## 配置说明
 
@@ -566,7 +620,7 @@ ss://...
 | `mail_credentials.txt` | 注册过程中创建的临时邮箱地址与邮箱凭据；邮箱创建后会在提交注册前提前持久化，因此可能包含后续失败、重试或结果不确定 attempt 的记录 |
 | `accounts_*.txt.pending.jsonl` | 主账号结果保存失败后尝试写入的恢复队列；成功入队后可用 `retry-pending` 恢复 |
 | `<sso_risk_rejected_file>.pending.jsonl` | 风控账号写入主隔离文件失败后的独立 risk pending；不要使用普通 `retry-pending` 恢复 |
-| `<grok2api_local_token_file>` | 可选 grok2api 本地 token 池；留空时默认项目目录下 `token.json` |
+| `<grok2api_local_token_file>` | 可选 grok2api 本地 token 池；留空时默认项目目录下 `data/token.json`；旧版根目录 `token.json` 会在首次写入时自动迁移 |
 | `<cpa_auth_dir>/xai-*.json` | 可选 CPA xAI OIDC 凭证；默认目录 `./cpa_auths` |
 | `<cpa_auth_dir>/cpa_auth_failed.txt` | CPA 导出失败记录 |
 | `screenshots/` | CPA 浏览器失败调试截图 |
@@ -603,6 +657,10 @@ python grok_register_ttk.py retry-pending <pending文件> [输出文件]
 ├── outlook_mailbox_pool.py    # Outlook 邮箱池管理与 OAuth token 更新
 ├── cpa_export.py              # CPA/OIDC 导出入口
 ├── cpa_xai/                   # CPA 浏览器、OAuth、代理辅助与凭证写入
+├── frontend/
+│   ├── src/app/               # React 页面、账号管理、任务历史与配置字段
+│   ├── src/lib/               # TypeScript API contracts
+│   └── package.json           # React / TypeScript / Vite
 ├── web/
 │   ├── server.py              # FastAPI WebUI 控制层
 │   ├── index.html             # WebUI 页面

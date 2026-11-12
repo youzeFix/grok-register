@@ -38,6 +38,7 @@ Grok Register is a Python-and-Chromium registration automation tool with GUI, CL
 
 - [Features](#features)
 - [Quick Start](#quick-start)
+- [Docker Deployment](#docker-deployment)
 - [Usage](#usage)
 - [Configuration](#configuration)
 - [Proxy & Proxy Pool](#proxy--proxy-pool)
@@ -68,14 +69,14 @@ Grok Register is a Python-and-Chromium registration automation tool with GUI, CL
   </tr>
   <tr>
     <td valign="top">
-      <p><sub>Need stable residential IPs? Try <a href="https://www.ipwo.net/?ref=githubgrokregister">IPWO</a> residential proxies.</sub></p>
+      <p><sub>Need reliable residential IPs? Try <a href="https://www.ipwo.net/?ref=githubgrokregister">IPWO</a> residential proxies.</sub></p>
       <p><sub>
         Coverage across 195+ countries and regions<br>
         Genuine residential IP resources<br>
-        Flexible IP rotation<br>
-        HTTP / HTTPS / SOCKS5 support
+        HTTP / HTTPS / SOCKS5 support<br>
+        Static IPs starting at just CNY 9.9 per IP per month<br>
+        Suitable for automated registration, account management, data collection, and cross-border business scenarios. Flexible integration with browser automation tools and proxy pools. Free trial available. Use discount code: <strong><code>0205</code></strong> to get 10% off.
       </sub></p>
-      <p><sub>Suitable for automated registration, account management, data collection, and cross-border operations. Integrates with browser automation tools and proxy pools. Free trial available. Discount code: <strong><code>0205</code></strong></sub></p>
     </td>
     <td valign="top">
       <p><sub>Need one dedicated residential IP per account? Try <a href="https://proxylane.dev/?utm_source=grok_register&amp;utm_medium=partnership&amp;utm_campaign=grok_register_sponsor_202610&amp;utm_content=github_readme">ProxyLane</a> residential proxies.</sub></p>
@@ -227,9 +228,13 @@ GUI:
 python grok_register_ttk.py
 ```
 
-WebUI:
+WebUI (the React frontend requires Node.js 22.12 or newer):
 
 ```bash
+cd frontend
+npm install
+npm run build
+cd ..
 python -m pip install -r requirements-web.txt
 python -m web.server
 ```
@@ -242,11 +247,38 @@ http://127.0.0.1:8092
 
 > GUI, CLI, and WebUI share the same `config.json` and registration logic. It is recommended to run a task from only one interface at a time.
 
+## Docker Deployment
+
+An AMD64 Docker image is provided with the React WebUI, FastAPI, and headless Chromium:
+
+```bash
+docker compose up -d --build
+docker compose logs -f app
+```
+
+Open `http://127.0.0.1:8092`. The first start initializes persistent configuration; subsequent settings can be edited in the WebUI.
+
+You can also pull a published GHCR image instead of building locally:
+
+```bash
+export GROK_REGISTER_IMAGE=ghcr.io/aaronl725/grok-register:latest
+docker compose pull
+docker compose up -d --no-build
+```
+
+See the [Docker deployment guide](docs/docker.en.md) for version tags and the automated release process.
+
+Configuration and runtime data are stored in Docker named volumes. A normal `docker compose down` preserves them. **Do not run `docker compose down -v` unless you intend to delete the configuration and all account data.**
+
+The Docker deployment provides the WebUI, not the desktop Tk GUI; Chromium runs headless. AMD64 is the only currently validated architecture, and native ARM64 support is not claimed.
+
+See the [Docker deployment guide](docs/docker.en.md) for details, backups, and optional sing-box setup.
+
 ## Usage
 
 ### WebUI (optional)
 
-See [Quick Start](#quick-start) for launch commands. The WebUI listens on `127.0.0.1:8092` by default and provides bilingual Chinese/English configuration, start/stop controls, batch statistics, real-time logs, proxy-pool node status, subscription parsing statistics, reload, and manual testing.
+See [Quick Start](#quick-start) for launch commands. The WebUI listens on `127.0.0.1:8092` by default and uses a React 19 + TypeScript frontend with a local FastAPI API. It provides bilingual configuration, start/stop controls, batch statistics, real-time logs, proxy-pool node status, subscription parsing statistics, reload, and manual testing. If `frontend/dist` has not been built, the server temporarily falls back to the legacy static interface.
 
 ### GUI
 
@@ -271,6 +303,32 @@ The CLI reads `config.json`. After validation, it prompts:
 Enter `start` to begin. Press `Ctrl+C` to request a stop.
 
 > The CLI only omits the Tk GUI. The registration page still uses a real Chromium / Chrome browser.
+
+### Dependency health checks
+
+Run static checks without network access:
+
+```bash
+python grok_register_ttk.py check
+```
+
+Run connection checks only when explicitly requested:
+
+```bash
+python grok_register_ttk.py check --connectivity
+```
+
+The GUI and WebUI also provide **Static check** and **Connectivity check** actions. Checks cover Configuration, Browser Runtime, Proxy, Mailbox, CPA, and Grok2API. Failures in required dependencies block the Ready result; CPA and Grok2API are optional integrations and produce warnings instead.
+
+Static checks inspect local configuration, installed dependencies, and local files only. Connectivity checks are user-triggered; they do not start registration, create a mailbox, or perform CPA OAuth authorization. Health checks are not automatically run before registration.
+
+See [Dependency health checks](docs/health-check.en.md) for details.
+
+### Existing-account reauthentication
+
+Stored accounts can be reauthenticated through normal email/password sign-in, refresh their SSO session, synchronize legacy TXT files, and update CPA/Grok2API authorization exports independently. The React WebUI now provides account filtering, details, bulk deletion/export, reauthentication controls, registration history, and failure screenshot previews.
+
+See [Reauthentication and authorization recovery](docs/reauthentication.en.md).
 
 ## Configuration
 
@@ -548,7 +606,7 @@ The two remote credential methods cannot be configured at the same time. The new
 | `mail_credentials.txt` | Temporary email addresses and email credentials created during registration. Email credentials are persisted before registration submission immediately after mailbox creation, so this file may include attempts that later failed, were retried, or ended with an uncertain outcome |
 | `accounts_*.txt.pending.jsonl` | Recovery queue attempted when saving the main account file fails; successfully queued results can be recovered with `retry-pending` |
 | `<sso_risk_rejected_file>.pending.jsonl` | Separate risk pending queue used when a quarantined account cannot be written to the main quarantine file; do not recover with the normal `retry-pending` command |
-| `<grok2api_local_token_file>` | Optional local grok2api token pool; defaults to `token.json` in the project directory when left empty |
+| `<grok2api_local_token_file>` | Optional local grok2api token pool; defaults to `data/token.json` in the project directory when left empty. A legacy root-level `token.json` is migrated on the first write |
 | `<cpa_auth_dir>/xai-*.json` | Optional CPA xAI OIDC credentials; default directory `./cpa_auths` |
 | `<cpa_auth_dir>/cpa_auth_failed.txt` | CPA export failure records |
 | `screenshots/` | CPA browser failure-debugging screenshots |
@@ -585,6 +643,10 @@ Recovery uses file locks, deduplication, and atomic replacement. Repeating the o
 ├── outlook_mailbox_pool.py    # Outlook pool and OAuth refresh-token updates
 ├── cpa_export.py              # CPA/OIDC export entry point
 ├── cpa_xai/                   # CPA browser, OAuth, proxy helpers, and credential writing
+├── frontend/
+│   ├── src/app/               # React pages, account management, task history, and configuration fields
+│   ├── src/lib/               # TypeScript API contracts
+│   └── package.json           # React / TypeScript / Vite
 ├── web/
 │   ├── server.py              # FastAPI WebUI control layer
 │   ├── index.html             # WebUI page

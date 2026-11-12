@@ -11,6 +11,10 @@ from datetime import datetime, timedelta, timezone
 
 from filelock import FileLock
 
+# 新版 grok2api 导入要等服务端串完多个 Cloudflare 解（每次约 18 秒），
+# 实测单次导入可达 59 秒；留足余量避免服务端已 200 而客户端先超时报假失败。
+GROK2API_GO_IMPORT_TIMEOUT_SEC = 180
+
 
 def _append_account_line_unlocked(path, email, password, sso):
     with open(path, "a", encoding="utf-8") as handle:
@@ -19,9 +23,103 @@ def _append_account_line_unlocked(path, email, password, sso):
         os.fsync(handle.fileno())
 
 
+def _normalize_output_path(path):
+    return os.path.realpath(os.path.abspath(os.path.expanduser(str(path))))
+
+
 def append_account_line(path, email, password, sso):
+    path = _normalize_output_path(path)
     with FileLock(path + ".lock", timeout=30):
         _append_account_line_unlocked(path, email, password, sso)
+
+
+def ensure_account_line(path, email, password, sso):
+    """Keep the legacy export in sync for an existing email/SSO identity."""
+    path = _normalize_output_path(path)
+    key = (str(email).strip().casefold(), str(sso).strip())
+    with FileLock(path + ".lock", timeout=30):
+        if not os.path.isfile(path):
+            _append_account_line_unlocked(path, email, password, sso)
+            return True
+
+        with open(path, "r", encoding="utf-8", newline="") as handle:
+            lines = handle.readlines()
+
+        found = False
+        updated = False
+        for index, line in enumerate(lines):
+            parts = line.rstrip("\r\n").split("----", 2)
+            if len(parts) != 3:
+                continue
+            if (parts[0].strip().casefold(), parts[2].strip()) != key:
+                continue
+            found = True
+            if parts[1] == str(password):
+                continue
+            newline = "\r\n" if line.endswith("\r\n") else "\n" if line.endswith("\n") else ""
+            lines[index] = "%s----%s----%s%s" % (email, password, sso, newline)
+            updated = True
+
+        if not found:
+            _append_account_line_unlocked(path, email, password, sso)
+            return True
+        if not updated:
+            return False
+
+        fd, temporary_path = tempfile.mkstemp(
+            prefix=".accounts-", suffix=".tmp", dir=os.path.dirname(path) or "."
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+                handle.writelines(lines)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(temporary_path, os.stat(path).st_mode & 0o777)
+            os.replace(temporary_path, path)
+        finally:
+            if os.path.exists(temporary_path):
+                os.unlink(temporary_path)
+        return True
+
+
+def replace_account_session(path, email, password, old_sso, new_sso):
+    """Atomically replace a legacy TXT account's old session without duplicating it."""
+    path = _normalize_output_path(path)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with FileLock(path + ".lock", timeout=30):
+        lines = []
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8", newline="") as handle:
+                lines = handle.readlines()
+        old_key = (str(email).casefold(), str(old_sso))
+        new_key = (str(email).casefold(), str(new_sso))
+        updated = []
+        found = False
+        for line in lines:
+            parts = line.rstrip("\r\n").split("----", 2)
+            key = (parts[0].strip().casefold(), parts[2].strip()) if len(parts) == 3 else None
+            if key in (old_key, new_key):
+                if not found:
+                    ending = "\r\n" if line.endswith("\r\n") else "\n"
+                    updated.append("%s----%s----%s%s" % (email, password, new_sso, ending))
+                    found = True
+            else:
+                updated.append(line)
+        if not found:
+            updated.append("%s----%s----%s\n" % (email, password, new_sso))
+
+        fd, temp_path = tempfile.mkstemp(prefix=".accounts-", suffix=".tmp", dir=os.path.dirname(path))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+                handle.writelines(updated)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(temp_path, os.stat(path).st_mode & 0o777 if os.path.exists(path) else 0o600)
+            os.replace(temp_path, path)
+        finally:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+
 
 
 _mail_credential_cache = {}
@@ -62,6 +160,7 @@ def save_mail_credential(base_dir, email, credential):
 
 
 def queue_unsaved_account(path, payload, error):
+    path = _normalize_output_path(path)
     pending_path = path + ".pending.jsonl"
     record = dict(payload)
     record["save_error"] = str(error)
@@ -199,11 +298,22 @@ def configure_token_runtime(config_ref, http_get, http_post, log_exception,
     globals()["RemoteTokenRequestError"] = request_error
 
 
-def resolve_grok2api_local_token_file():
-    configured = str(config.get("grok2api_local_token_file", "") or "").strip()
+def resolve_grok2api_local_token_file(config_ref=None):
+    settings = config if config_ref is None else config_ref
+    configured = str(settings.get("grok2api_local_token_file", "") or "").strip()
     if configured:
         return configured
-    return os.path.join(os.path.dirname(__file__), "token.json")
+    return os.path.join(os.path.dirname(__file__), "data", "token.json")
+
+
+def _migrate_legacy_grok2api_local_token_file(token_file):
+    if str(config.get("grok2api_local_token_file", "") or "").strip():
+        return False
+    legacy_file = os.path.join(os.path.dirname(__file__), "token.json")
+    if not os.path.isfile(legacy_file) or os.path.exists(token_file):
+        return False
+    os.replace(legacy_file, token_file)
+    return True
 
 def _normalize_sso_token(raw_token):
     token = str(raw_token or "").strip()
@@ -231,6 +341,8 @@ def add_token_to_grok2api_local_pool(raw_token, email="", log_callback=None):
     except Exception as exc:
         raise RuntimeError(f"filelock 依赖不可用，拒绝非原子写入 token 池: {exc}")
     with FileLock(lock_path, timeout=30):
+        if _migrate_legacy_grok2api_local_token_file(token_file) and log_callback:
+            log_callback("[*] 已将旧版项目根目录 token.json 迁移至 data/token.json")
         data = {}
         if os.path.exists(token_file):
             try:
@@ -430,6 +542,18 @@ def _parse_grok2api_go_import(response, secrets=()):
     return completed
 
 
+def build_grok2api_web_import_document(token, email=""):
+    """构造新版 grok2api 的 Grok Web JSON 导入文档。
+
+    纯文本导入会被服务端硬编码成 ``Grok Web <token哈希>`` 名称且不带邮箱，
+    只有 JSON 文档才能让服务端采用我们给定的 name / email。
+    """
+    entry = {"name": email or "", "sso_token": token}
+    if email:
+        entry["email"] = email
+    return {"provider": "grok_web", "accounts": [entry]}
+
+
 def _add_token_to_grok2api_go_remote_pool(token, email="", log_callback=None):
     base = str(config.get("grok2api_remote_base", "") or "").strip()
     username = str(config.get("grok2api_remote_admin_username", "") or "").strip()
@@ -440,21 +564,22 @@ def _add_token_to_grok2api_go_remote_pool(token, email="", log_callback=None):
         from curl_cffi import CurlMime
     except Exception as exc:
         raise RemoteTokenRequestError(f"无法创建新版 grok2api 导入表单: {exc}") from exc
+    document = build_grok2api_web_import_document(token, email)
     for attempt in range(2):
         access_token = _get_grok2api_admin_token(api_base, username, password, force=attempt > 0)
         multipart = CurlMime()
         multipart.addpart(
             name="file",
-            filename="grok-web-sso.txt",
-            content_type="text/plain; charset=utf-8",
-            data=(token + "\n").encode("utf-8"),
+            filename="grok-web-sso.json",
+            content_type="application/json; charset=utf-8",
+            data=json.dumps(document, ensure_ascii=False).encode("utf-8"),
         )
         try:
             response = http_post(
                 endpoint,
                 headers={"Authorization": f"Bearer {access_token}", "Accept": "text/event-stream"},
                 multipart=multipart,
-                timeout=60,
+                timeout=GROK2API_GO_IMPORT_TIMEOUT_SEC,
                 proxies={},
                 verify=True,
             )

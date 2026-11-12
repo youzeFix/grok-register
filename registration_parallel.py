@@ -72,7 +72,9 @@ def _aggregate(snapshots):
 
 def run_parallel_batch(count, callbacks, observer, runtime_namespace, accounts_output_file,
                        workers=4, enable_nsfw=True, cleanup_interval=5,
-                       max_slot_retry=3, max_mail_retry=3):
+                       max_slot_retry=3, max_mail_retry=3, persist_account_record=None,
+                       persist_account_status=None, registration_run_id=None,
+                       diagnostics_dir=None):
     worker_counts = split_worker_counts(count, workers)
     if len(worker_counts) <= 1:
         raise ValueError("parallel batch requires at least two active workers")
@@ -111,7 +113,7 @@ def run_parallel_batch(count, callbacks, observer, runtime_namespace, accounts_o
         mail_module.bind_runtime(mail_runtime)
 
         worker_namespace = dict(mail_runtime)
-        for name in ("get_email_and_token", "get_oai_code", "get_user_agent"):
+        for name in ("get_email_and_token", "release_email_lease", "get_oai_code", "get_user_agent"):
             if hasattr(mail_module, name):
                 worker_namespace[name] = getattr(mail_module, name)
 
@@ -122,7 +124,10 @@ def run_parallel_batch(count, callbacks, observer, runtime_namespace, accounts_o
         browser_module.bind_runtime(worker_namespace)
 
         worker_callbacks = RegistrationCallbacks(
-            log=worker_log, cancelled=combined_cancelled, stop_all=abort_event.set
+            log=worker_log,
+            cancelled=combined_cancelled,
+            stop_all=abort_event.set,
+            record_attempt=callbacks.record_attempt,
         )
 
         def preflight_mail():
@@ -163,6 +168,8 @@ def run_parallel_batch(count, callbacks, observer, runtime_namespace, accounts_o
         def worker_cleanup(reason):
             worker_log("%s: 关闭本 worker 注册浏览器" % reason)
             browser_module.stop_browser()
+
+        from registration_diagnostics import capture_failure_screenshot
 
         operations = RegistrationOperations(
             start_browser=lambda: browser_module.start_browser(log_callback=worker_log),
@@ -206,6 +213,15 @@ def run_parallel_batch(count, callbacks, observer, runtime_namespace, accounts_o
                 sso, email, worker_log
             ),
             preflight_mail=preflight_mail,
+            persist_account_record=persist_account_record,
+            persist_account_status=persist_account_status,
+            capture_failure_diagnostics=lambda details: capture_failure_screenshot(
+                browser_module.page,
+                registration_run_id,
+                details,
+                log_callback=worker_log,
+                screenshot_dir=diagnostics_dir,
+            ),
         )
 
         def worker_observer(batch, account, output):
@@ -249,6 +265,8 @@ def run_parallel_batch(count, callbacks, observer, runtime_namespace, accounts_o
                 try:
                     future.result()
                 except Exception as exc:
+                    # Pre-submit transient failures are retried inside run_batch.
+                    # An exception escaping a worker is therefore genuinely fatal.
                     fatal_errors.append((worker_id, exc))
                     abort_event.set()
                     callbacks.log("[!] T%s worker 级异常，正在停止其他 worker: %s" % (worker_id, exc))
