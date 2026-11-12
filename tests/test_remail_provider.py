@@ -154,6 +154,35 @@ class RemailOrderTests(unittest.TestCase):
         self.assertIn("Idempotency-Key", kwargs["headers"])
         self.assertEqual(kwargs["headers"]["Authorization"], "Bearer rk-test")
 
+    def test_create_order_supports_purchase_mode(self):
+        calls = []
+
+        def fake_post(url, **kwargs):
+            calls.append((url, kwargs))
+            return FakeResponse({
+                "orderNo": "MT010",
+                "status": "active",
+                "deliveryEmail": "pp@outlook.com",
+                "serviceToken": "svc",
+            })
+
+        with patch.dict(mail_service.config, {
+            "remail_api_key": "rk-test",
+            "remail_project_id": "1001",
+            "remail_email_suffix": "outlook.com",
+            "remail_service_mode": "purchase",
+        }), patch.object(mail_service, "http_post", side_effect=fake_post, create=True):
+            order = mail_service.remail_create_order()
+        self.assertEqual(order["orderNo"], "MT010")
+        _, kwargs = calls[0]
+        self.assertEqual(kwargs["params"], {"serviceMode": "purchase"})
+
+    def test_service_mode_falls_back_to_code(self):
+        with patch.dict(mail_service.config, {"remail_service_mode": "bogus"}):
+            self.assertEqual(mail_service.get_remail_service_mode(), "code")
+        with patch.dict(mail_service.config, {}):
+            self.assertEqual(mail_service.get_remail_service_mode(), "code")
+
     def test_paid_order_polls_until_active(self):
         def fake_post(url, **kwargs):
             return FakeResponse({"orderNo": "MT003", "status": "paid"})

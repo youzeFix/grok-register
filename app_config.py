@@ -83,6 +83,7 @@ DEFAULT_CONFIG = {
     "remail_api_key": "",
     "remail_project_id": "",
     "remail_email_suffix": "outlook.com",
+    "remail_service_mode": "code",
     "defaultDomains": "",
 }
 
@@ -160,6 +161,7 @@ def validate_config_structure(raw):
         cfg[key] = _require_string(cfg, key)
     enums = {
         "email_provider": {"duckmail", "yyds", "cloudflare", "cloudmail", "outlook", "remail"},
+        "remail_service_mode": {"code", "purchase"},
         "cloudflare_auth_mode": {"query-key", "bearer", "x-api-key", "x-admin-auth", "none"},
         "grok2api_pool_name": {"ssoBasic", "ssoSuper"},
         "proxy_mode": {"auto", "direct", "single", "pool"},

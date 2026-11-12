@@ -70,6 +70,7 @@
   "remail_api_key": "",
   "remail_project_id": "",
   "remail_email_suffix": "outlook.com",
+  "remail_service_mode": "code",
   "cpa_oidc_request_timeout_sec": 15,
   "cpa_oidc_poll_timeout_sec": 15,
   "grok2api_allow_legacy_full_save": false

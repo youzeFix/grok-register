@@ -70,6 +70,7 @@ export const configGroups: ConfigGroup[] = [
         '留空时按邮箱后缀自动选择有库存的项目。', 'Left empty: auto-pick a project with stock for the suffix.'),
       text('remail_email_suffix', 'Remail 邮箱后缀', 'Remail email suffix', false,
         '接码下单使用的邮箱后缀，默认 outlook.com。', 'Suffix used for code orders, default outlook.com.'),
+      select('remail_service_mode', 'Remail 下单模式', 'Remail order mode', ['code', 'purchase']),
       text('remail_api_base', 'Remail API Base', 'Remail API base', true,
         '默认 https://remail.best。', 'Defaults to https://remail.best.'),
       text('cloudflare_api_base', 'Cloudflare API Base', 'Cloudflare API base', true),

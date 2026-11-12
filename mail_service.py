@@ -49,7 +49,7 @@ def _detail_retry_attempt(state, message_id, now=None):
     record["next_retry_at"] = current + delay
     return attempt
 
-_OWN_NAMES = {'cloudmail_build_headers', 'cloudmail_preflight', 'cloudmail_wait_for_auth', 'cloudmail_get_email_and_token', 'get_messages', 'cloudflare_get_messages', 'get_yyds_api_key', 'yyds_generate_username', 'yyds_get_domains', 'yyds_get_email_and_token', 'yyds_get_oai_code', 'get_email_provider', 'cloudflare_get_domains', 'extract_verification_code', 'get_cloudflare_api_base', 'cloudflare_apply_auth_params', 'duckmail_get_oai_code', 'create_account', 'get_yyds_jwt', 'get_message_detail', 'yyds_create_account', 'get_duckmail_api_key', 'get_cloudflare_path', 'cloudflare_create_account', 'cloudflare_get_token', 'cloudflare_get_oai_code', 'get_cloudmail_public_token', 'generate_username', 'yyds_get_message_detail', 'cloudflare_next_default_domain', 'yyds_get_messages', 'yyds_get_token', 'get_domains', 'get_token', 'cloudflare_create_temp_address', 'get_cloudflare_api_key', 'get_cloudmail_path', 'get_cloudmail_api_base', 'cloudmail_get_oai_code', 'cloudflare_build_headers', 'cloudflare_is_admin_create_path', 'cloudmail_next_domain', 'cloudflare_get_message_detail', 'cloudmail_get_messages', 'get_user_agent', 'yyds_pick_domain', '_pick_list_payload', 'get_email_and_token', 'release_email_lease', 'get_oai_code', 'get_cloudflare_auth_mode', 'pick_domain', 'get_remail_api_base', 'get_remail_api_key', 'get_remail_project_id', 'get_remail_email_suffix', 'remail_headers', 'remail_list_projects', 'remail_pick_project_id', 'remail_get_order', 'remail_wait_order_active', 'remail_create_order', 'remail_get_email_and_token', 'remail_get_messages', 'remail_get_message_detail', 'remail_get_oai_code'}
+_OWN_NAMES = {'cloudmail_build_headers', 'cloudmail_preflight', 'cloudmail_wait_for_auth', 'cloudmail_get_email_and_token', 'get_messages', 'cloudflare_get_messages', 'get_yyds_api_key', 'yyds_generate_username', 'yyds_get_domains', 'yyds_get_email_and_token', 'yyds_get_oai_code', 'get_email_provider', 'cloudflare_get_domains', 'extract_verification_code', 'get_cloudflare_api_base', 'cloudflare_apply_auth_params', 'duckmail_get_oai_code', 'create_account', 'get_yyds_jwt', 'get_message_detail', 'yyds_create_account', 'get_duckmail_api_key', 'get_cloudflare_path', 'cloudflare_create_account', 'cloudflare_get_token', 'cloudflare_get_oai_code', 'get_cloudmail_public_token', 'generate_username', 'yyds_get_message_detail', 'cloudflare_next_default_domain', 'yyds_get_messages', 'yyds_get_token', 'get_domains', 'get_token', 'cloudflare_create_temp_address', 'get_cloudflare_api_key', 'get_cloudmail_path', 'get_cloudmail_api_base', 'cloudmail_get_oai_code', 'cloudflare_build_headers', 'cloudflare_is_admin_create_path', 'cloudmail_next_domain', 'cloudflare_get_message_detail', 'cloudmail_get_messages', 'get_user_agent', 'yyds_pick_domain', '_pick_list_payload', 'get_email_and_token', 'release_email_lease', 'get_oai_code', 'get_cloudflare_auth_mode', 'pick_domain', 'get_remail_api_base', 'get_remail_api_key', 'get_remail_project_id', 'get_remail_email_suffix', 'get_remail_service_mode', 'remail_headers', 'remail_list_projects', 'remail_pick_project_id', 'remail_get_order', 'remail_wait_order_active', 'remail_create_order', 'remail_get_email_and_token', 'remail_get_messages', 'remail_get_message_detail', 'remail_get_oai_code'}
 
 
 _RUNTIME_DEPENDENCIES = (
@@ -1449,6 +1449,12 @@ def get_remail_email_suffix():
     return suffix or "outlook.com"
 
 
+def get_remail_service_mode():
+    """下单服务模式：code=短效接码，purchase=长效购买（均不交付邮箱账号凭据）。"""
+    mode = str(config.get("remail_service_mode", "code") or "code").strip().lower()
+    return mode if mode in ("code", "purchase") else "code"
+
+
 REMAIL_PLATFORM_HINTS = ("grok", "x.ai")
 
 
@@ -1544,7 +1550,7 @@ def remail_create_order(api_key=None, project_id=None, email_suffix=None):
     idempotency_key = f"grok-register-{secrets.token_hex(12)}"
     resp = http_post(
         f"{get_remail_api_base()}/v1/open/orders",
-        params={"serviceMode": "code"},
+        params={"serviceMode": get_remail_service_mode()},
         json=payload,
         headers={**headers, "Idempotency-Key": idempotency_key},
         proxies={},
