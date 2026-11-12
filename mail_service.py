@@ -1427,7 +1427,7 @@ def yyds_pick_domain(api_key=None, jwt=None):
     raise Exception("YYDS 无已验证域名可用")
 
 
-REMAIL_API_BASE = "https://remail.aishop6.com"
+REMAIL_API_BASE = "https://remail.best"
 REMAIL_ORDER_ACTIVATE_TIMEOUT = 60.0
 REMAIL_ORDER_FAILURE_STATUSES = {"refunded", "failed", "closed"}
 

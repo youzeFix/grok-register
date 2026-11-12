@@ -79,7 +79,7 @@ DEFAULT_CONFIG = {
     "email_provider": "duckmail",
     "yyds_api_key": "",
     "yyds_jwt": "",
-    "remail_api_base": "https://remail.aishop6.com",
+    "remail_api_base": "https://remail.best",
     "remail_api_key": "",
     "remail_project_id": "",
     "remail_email_suffix": "outlook.com",
