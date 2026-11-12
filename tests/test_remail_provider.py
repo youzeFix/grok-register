@@ -183,6 +183,55 @@ class RemailOrderTests(unittest.TestCase):
         with patch.dict(mail_service.config, {}):
             self.assertEqual(mail_service.get_remail_service_mode(), "code")
 
+    def test_remail_http_get_falls_back_to_proxy_on_transport_error(self):
+        class CurlError(Exception):
+            pass
+
+        direct_calls, proxy_calls = [], []
+
+        def fake_get(url, **kwargs):
+            if kwargs.get("proxies") == {}:
+                direct_calls.append(url)
+                raise CurlError("curl: (28) Connection timed out")
+            proxy_calls.append((url, kwargs.get("proxies")))
+            return FakeResponse({"ok": True})
+
+        with patch.dict(mail_service.config, {"proxy": "http://127.0.0.1:7900"}), \
+             patch.object(mail_service, "http_get", side_effect=fake_get, create=True):
+            resp = mail_service.remail_http_get("https://remail.best/v1/pickup")
+        self.assertEqual(resp.json(), {"ok": True})
+        self.assertEqual(len(direct_calls), 1)
+        self.assertEqual(len(proxy_calls), 1)
+        url, proxies = proxy_calls[0]
+        self.assertEqual(proxies, {"http": "http://127.0.0.1:7900", "https": "http://127.0.0.1:7900"})
+
+    def test_remail_http_get_reraises_when_no_proxy_available(self):
+        class CurlError(Exception):
+            pass
+
+        calls = []
+
+        def fake_get(url, **kwargs):
+            calls.append(kwargs.get("proxies"))
+            raise CurlError("curl: (28) Connection timed out")
+
+        with patch.dict(mail_service.config, {"proxy": ""}), \
+             patch.object(mail_service, "http_get", side_effect=fake_get, create=True):
+            with self.assertRaises(CurlError):
+                mail_service.remail_http_get("https://remail.best/v1/pickup")
+        self.assertEqual(calls, [{}])
+
+    def test_remail_http_get_reraises_http_errors(self):
+        class SomeHttpError(Exception):
+            pass
+
+        def fake_get(url, **kwargs):
+            raise SomeHttpError("400 Bad Request")
+
+        with patch.object(mail_service, "http_get", side_effect=fake_get, create=True):
+            with self.assertRaises(SomeHttpError):
+                mail_service.remail_http_get("https://remail.best/v1/pickup")
+
     def test_paid_order_polls_until_active(self):
         def fake_post(url, **kwargs):
             return FakeResponse({"orderNo": "MT003", "status": "paid"})

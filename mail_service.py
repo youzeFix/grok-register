@@ -49,7 +49,7 @@ def _detail_retry_attempt(state, message_id, now=None):
     record["next_retry_at"] = current + delay
     return attempt
 
-_OWN_NAMES = {'cloudmail_build_headers', 'cloudmail_preflight', 'cloudmail_wait_for_auth', 'cloudmail_get_email_and_token', 'get_messages', 'cloudflare_get_messages', 'get_yyds_api_key', 'yyds_generate_username', 'yyds_get_domains', 'yyds_get_email_and_token', 'yyds_get_oai_code', 'get_email_provider', 'cloudflare_get_domains', 'extract_verification_code', 'get_cloudflare_api_base', 'cloudflare_apply_auth_params', 'duckmail_get_oai_code', 'create_account', 'get_yyds_jwt', 'get_message_detail', 'yyds_create_account', 'get_duckmail_api_key', 'get_cloudflare_path', 'cloudflare_create_account', 'cloudflare_get_token', 'cloudflare_get_oai_code', 'get_cloudmail_public_token', 'generate_username', 'yyds_get_message_detail', 'cloudflare_next_default_domain', 'yyds_get_messages', 'yyds_get_token', 'get_domains', 'get_token', 'cloudflare_create_temp_address', 'get_cloudflare_api_key', 'get_cloudmail_path', 'get_cloudmail_api_base', 'cloudmail_get_oai_code', 'cloudflare_build_headers', 'cloudflare_is_admin_create_path', 'cloudmail_next_domain', 'cloudflare_get_message_detail', 'cloudmail_get_messages', 'get_user_agent', 'yyds_pick_domain', '_pick_list_payload', 'get_email_and_token', 'release_email_lease', 'get_oai_code', 'get_cloudflare_auth_mode', 'pick_domain', 'get_remail_api_base', 'get_remail_api_key', 'get_remail_project_id', 'get_remail_email_suffix', 'get_remail_service_mode', 'remail_headers', 'remail_list_projects', 'remail_pick_project_id', 'remail_get_order', 'remail_wait_order_active', 'remail_create_order', 'remail_get_email_and_token', 'remail_get_messages', 'remail_get_message_detail', 'remail_get_oai_code'}
+_OWN_NAMES = {'cloudmail_build_headers', 'cloudmail_preflight', 'cloudmail_wait_for_auth', 'cloudmail_get_email_and_token', 'get_messages', 'cloudflare_get_messages', 'get_yyds_api_key', 'yyds_generate_username', 'yyds_get_domains', 'yyds_get_email_and_token', 'yyds_get_oai_code', 'get_email_provider', 'cloudflare_get_domains', 'extract_verification_code', 'get_cloudflare_api_base', 'cloudflare_apply_auth_params', 'duckmail_get_oai_code', 'create_account', 'get_yyds_jwt', 'get_message_detail', 'yyds_create_account', 'get_duckmail_api_key', 'get_cloudflare_path', 'cloudflare_create_account', 'cloudflare_get_token', 'cloudflare_get_oai_code', 'get_cloudmail_public_token', 'generate_username', 'yyds_get_message_detail', 'cloudflare_next_default_domain', 'yyds_get_messages', 'yyds_get_token', 'get_domains', 'get_token', 'cloudflare_create_temp_address', 'get_cloudflare_api_key', 'get_cloudmail_path', 'get_cloudmail_api_base', 'cloudmail_get_oai_code', 'cloudflare_build_headers', 'cloudflare_is_admin_create_path', 'cloudmail_next_domain', 'cloudflare_get_message_detail', 'cloudmail_get_messages', 'get_user_agent', 'yyds_pick_domain', '_pick_list_payload', 'get_email_and_token', 'release_email_lease', 'get_oai_code', 'get_cloudflare_auth_mode', 'pick_domain', 'get_remail_api_base', 'get_remail_api_key', 'get_remail_project_id', 'get_remail_email_suffix', 'get_remail_service_mode', 'remail_headers', 'remail_list_projects', 'remail_pick_project_id', 'remail_get_order', 'remail_wait_order_active', 'remail_create_order', 'remail_get_email_and_token', 'remail_get_messages', 'remail_get_message_detail', 'remail_get_oai_code', 'remail_http_get', 'remail_http_post'}
 
 
 _RUNTIME_DEPENDENCIES = (
@@ -1499,10 +1499,72 @@ def remail_headers(api_key=None):
     return {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
 
 
+_REMAIL_TRANSPORT_ERROR_NAMES = {
+    "CurlError", "ConnectionError", "ConnectTimeout", "ReadTimeout",
+    "Timeout", "SSLError", "ProxyTimeoutError",
+}
+
+
+def _is_remail_transport_error(exc):
+    seen = 0
+    while exc is not None and seen < 5:
+        if type(exc).__name__ in _REMAIL_TRANSPORT_ERROR_NAMES:
+            return True
+        exc = exc.__cause__ or exc.__context__
+        seen += 1
+    return False
+
+
+def _remail_fallback_proxies():
+    """直连失败时可选的代理地址：优先当前账号租约代理，其次配置里的固定代理。"""
+    candidates = []
+    try:
+        from browser_runtime import current_proxy_lease
+        lease = current_proxy_lease()
+    except Exception:
+        lease = None
+    if lease is not None and str(getattr(lease, "proxy_url", "") or "").strip():
+        candidates.append(str(lease.proxy_url).strip())
+    configured = str(config.get("proxy", "") or "").strip()
+    if configured and configured not in candidates:
+        candidates.append(configured)
+    return candidates
+
+
+def _remail_request_with_fallback(sender, url, **kwargs):
+    try:
+        return sender(url, **{**kwargs, "proxies": {}})
+    except Exception as exc:
+        if not _is_remail_transport_error(exc):
+            raise
+        for proxy in _remail_fallback_proxies():
+            try:
+                print(f"[Debug] Remail 直连失败，回退代理重试: {str(exc)[:70]}")
+                proxies = {"http": proxy, "https": proxy}
+                return sender(url, **{**kwargs, "proxies": proxies})
+            except Exception as retry_exc:
+                if not _is_remail_transport_error(retry_exc):
+                    raise
+        raise
+
+
+def remail_http_get(url, **kwargs):
+    """Remail 请求传输层：直连优先，网络层失败（超时/连接错误）回退走代理。
+
+    remail 直连路由随运营商状况波动，曾出现直连完全不通而代理正常的情况；
+    服务器已应答的 HTTP 错误（4xx/5xx）不属于传输层失败，不重试。
+    """
+    return _remail_request_with_fallback(http_get, url, **kwargs)
+
+
+def remail_http_post(url, **kwargs):
+    return _remail_request_with_fallback(http_post, url, **kwargs)
+
+
 def remail_list_projects(api_key=None):
     """查询项目列表，返回 projects 数组（调试/自动选项目用）。"""
     headers = remail_headers(api_key)
-    resp = http_get(f"{get_remail_api_base()}/v1/open/projects", headers=headers, proxies={})
+    resp = remail_http_get(f"{get_remail_api_base()}/v1/open/projects", headers=headers)
     resp.raise_for_status()
     data = resp.json()
     if isinstance(data, dict):
@@ -1512,7 +1574,7 @@ def remail_list_projects(api_key=None):
 
 def remail_get_order(order_no, api_key=None):
     headers = remail_headers(api_key)
-    resp = http_get(f"{get_remail_api_base()}/v1/open/orders/{order_no}", headers=headers, proxies={})
+    resp = remail_http_get(f"{get_remail_api_base()}/v1/open/orders/{order_no}", headers=headers)
     resp.raise_for_status()
     return resp.json()
 
@@ -1548,7 +1610,7 @@ def remail_create_order(api_key=None, project_id=None, email_suffix=None):
         pid_raw = remail_pick_project_id(suffix, api_key=api_key)
     payload = {"projectId": int(pid_raw), "emailSuffix": suffix}
     idempotency_key = f"grok-register-{secrets.token_hex(12)}"
-    resp = http_post(
+    resp = remail_http_post(
         f"{get_remail_api_base()}/v1/open/orders",
         params={"serviceMode": get_remail_service_mode()},
         json=payload,
@@ -1584,10 +1646,9 @@ def remail_get_email_and_token(api_key=None, project_id=None, email_suffix=None)
 
 def remail_get_messages(address, token=None):
     """取件读取邮件：pickup 接口使用订单交付邮箱 + serviceToken，无需 API Key。"""
-    resp = http_get(
+    resp = remail_http_get(
         f"{get_remail_api_base()}/v1/pickup",
         params={"email": address, "token": token},
-        proxies={},
     )
     resp.raise_for_status()
     data = resp.json()
@@ -1595,10 +1656,9 @@ def remail_get_messages(address, token=None):
 
 
 def remail_get_message_detail(message_id, address, token=None):
-    resp = http_get(
+    resp = remail_http_get(
         f"{get_remail_api_base()}/v1/pickup/messages/{message_id}",
         params={"email": address, "token": token},
-        proxies={},
     )
     resp.raise_for_status()
     return resp.json()
