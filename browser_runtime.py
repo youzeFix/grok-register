@@ -1,9 +1,104 @@
 """提供共享的 HTTP 请求、代理处理和 Chromium 启动参数。"""
 import os
+import threading
 import urllib.parse
 
 from DrissionPage import ChromiumOptions
 from curl_cffi import requests
+from curl_cffi import CurlOpt
+
+CURL_IPRESOLVE_V4 = 1
+"""强制 curl 走 IPv4：临时邮箱等直连目标存在 IPv6 破路时兜底；经代理的连接不受影响。"""
+
+DRIESSION_DATA_MARKER = "/tmp/DrissionPage"
+
+
+def sweep_orphan_browsers(log_callback=None):
+    """清理被 kill 的引擎遗留的浏览器进程，返回被清掉的浏览器主进程 pid 列表。
+
+    识别特征：chromium 主进程 cmdline 含 --remote-debugging-port 且 user-data-dir
+    位于 /tmp/DrissionPage（仅本工具创建的数据目录），且其父进程不是存活的
+    项目引擎（grok_register_ttk / supervisor）。只会杀本工具启动的浏览器，
+    不会碰用户自己的 Chrome（无该数据目录）。
+    """
+    import psutil
+
+    killed = []
+    try:
+        procs = list(psutil.process_iter(["pid", "cmdline"]))
+    except Exception:
+        return killed
+
+    def _engine_alive(pid):
+        try:
+            p = psutil.Process(pid)
+            name = (p.name() or "").lower()
+            if "python" not in name:
+                return False
+            cmd = " ".join(p.cmdline() or [])
+            return "grok_register_ttk" in cmd or "supervisor.py" in cmd
+        except Exception:
+            return False
+
+    for proc in procs:
+        try:
+            info = proc.info or {}
+            cmd = " ".join(info.get("cmdline") or [])
+            if DRIESSION_DATA_MARKER not in cmd:
+                continue
+            if "--remote-debugging-port" not in cmd:
+                # 子进程会随主进程一起被 kill tree，跳过
+                continue
+            parent_pid = proc.ppid()
+            if parent_pid and _engine_alive(parent_pid):
+                continue  # 当前引擎正在使用，勿动
+            victims = [proc] + proc.children(recursive=True)
+            for victim in victims:
+                try:
+                    victim.kill()
+                except Exception:
+                    pass
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+            killed.append(info.get("pid"))
+        except psutil.NoSuchProcess:
+            continue
+        except Exception:
+            continue
+    if killed and log_callback:
+        log_callback(f"[*] 已清理 {len(killed)} 个遗留浏览器 (pid: {killed})")
+    return killed
+
+_OSSL_SESSION = None
+_OSSL_LOCK = threading.Lock()
+
+
+def _is_openssl_fallback_worthy(exc, request_kwargs):
+    """curl TLS 握手失败时切换到 OpenSSL 客户端兜底。
+
+    curl_cffi 基于 BoringSSL；个别站点（如临时邮箱源）会间歇性拒绝其握手，
+    而 OpenSSL 客户端同一时刻可正常访问。仅对直连请求兜底，避免掩盖代理故障。
+    """
+    if request_kwargs.get("proxies"):
+        return False
+    text = str(exc)
+    return "TLS connect error" in text or "unexpected eof" in text.lower()
+
+
+def _openssl_request(method, url, request_kwargs):
+    global _OSSL_SESSION
+    with _OSSL_LOCK:
+        if _OSSL_SESSION is None:
+            import requests as ssl_requests
+
+            _OSSL_SESSION = ssl_requests.Session()
+            _OSSL_SESSION.trust_env = False
+    kwargs = dict(request_kwargs)
+    kwargs.pop("curl_options", None)
+    kwargs["timeout"] = max(float(kwargs.get("timeout") or 0), 30.0)
+    return _OSSL_SESSION.request(method, url, **kwargs)
 from cpa_xai.proxyutil import (
     LocalAuthProxyBridge,
     prepare_chromium_proxy,
@@ -117,9 +212,16 @@ def page_has_proxy_error(page_obj):
         "err_proxy", "proxy connection failed", "proxy server",
         "proxy authentication", "tunnel connection failed",
         "无法连接到代理服务器", "代理服务器",
+        # 通用浏览器级连接失败（节点不通也会走到这里）
+        "err_connection", "err_timed", "err_internet_disconnected",
+        "err_name_not_resolved", "err_address_unreachable",
+        "err_empty_response", "err_tunnel", "err_network",
+        "can't be reached", "cannot be reached", "isn't reachable",
+        "无法访问此网站", "网站无法访问", "无法访问此页面",
     ))
-    if failed and managed_proxy_active():
-        raise ProxyTransportError("Chromium 检测到代理连接错误页面")
+    # 配置了代理（managed 或 legacy auto+proxy）时视为代理传输失败，交由引擎按租约策略处理
+    if failed and (managed_proxy_active() or bool(get_configured_proxy())):
+        raise ProxyTransportError("Chromium 页面显示连接失败/代理错误: %s" % (title or url))
     return failed
 
 
@@ -191,6 +293,9 @@ def _build_request_kwargs(**kwargs):
         proxies = get_proxies()
     if proxies:
         request_kwargs["proxies"] = proxies
+    curl_options = request_kwargs.pop("curl_options", None) or {}
+    curl_options.setdefault(CurlOpt.IPRESOLVE, CURL_IPRESOLVE_V4)
+    request_kwargs["curl_options"] = curl_options
     request_kwargs.setdefault("timeout", 15)
     return request_kwargs
 
@@ -200,6 +305,8 @@ def http_get(url, **kwargs):
     try:
         return requests.get(url, **request_kwargs)
     except Exception as exc:
+        if _is_openssl_fallback_worthy(exc, request_kwargs):
+            return _openssl_request("GET", url, request_kwargs)
         if is_proxy_connection_error(exc):
             if managed_proxy_active():
                 raise ProxyTransportError(safe_proxy_error_text(exc)) from exc
@@ -215,6 +322,8 @@ def http_post(url, **kwargs):
     try:
         return requests.post(url, **request_kwargs)
     except Exception as exc:
+        if _is_openssl_fallback_worthy(exc, request_kwargs):
+            return _openssl_request("POST", url, request_kwargs)
         if is_proxy_connection_error(exc):
             if managed_proxy_active() or not replay_safe:
                 raise ProxyTransportError(safe_proxy_error_text(exc)) from exc

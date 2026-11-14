@@ -117,6 +117,10 @@ class AuditedReliabilityRepairTests(unittest.TestCase):
             def run_js(self, script, *args):
                 if "document.body ? document.body.innerText" in script:
                     return ""
+                if "inputs.some" in script:
+                    return True
+                if "otp: otpInput" in script:
+                    return json.dumps({"url": "https://accounts.x.ai/check-email", "otp": True})
                 if "const email = arguments[0]" in script:
                     events.append("fill-email")
                     return json.dumps({"state": "filled", "url": self.url})
@@ -152,6 +156,8 @@ class AuditedReliabilityRepairTests(unittest.TestCase):
             def run_js(self, script, *args):
                 if "if (!code) return 'not-ready'" in script:
                     return "aggregate"
+                if "document.body ? document.body.innerText" in script:
+                    return ""
                 if "function setInputValue" in script:
                     return "filled-aggregate"
                 if "if (!btn) return 'no-button'" in script:
@@ -192,6 +198,8 @@ class AuditedReliabilityRepairTests(unittest.TestCase):
             def run_js(self, script, *args):
                 if "if (!code) return 'not-ready'" in script:
                     return "aggregate"
+                if "document.body ? document.body.innerText" in script:
+                    return ""
                 if "function setInputValue" in script:
                     return "filled-aggregate"
                 if "if (!btn) return 'no-button'" in script:

@@ -46,11 +46,26 @@ DEFAULT_CONFIG = {
     "proxy_pool_persist_health": False,
     "proxy_pool_state_file": "./proxy_pool_state.json",
     "proxy_pool_subscription_public_only": False,
+    "pool_chain_proxy": "",
+    "proxy_pool_group_size": 1,
     "proxy_pool_preflight_enabled": True,
     "enable_nsfw": True,
     "sso_risk_gate_enabled": True,
     "sso_risk_rejected_file": "./sso_risk_rejected.txt",
+    "clash_api_url": "http://127.0.0.1:9097",
+    "clash_api_secret": "",
+    "clash_proxy_group": "",
+    "clash_rotate_nodes": "",
+    "clash_rotate_every": 0,
+    "clash_node_fail_threshold": 2,
+    "clash_node_dead_cooldown_sec": 300,
+    "email_entry_block_threshold": 3,
+    "email_entry_block_cooldown_sec": 1200,
+    "cf_turnstile_auto_click": False,
+    "post_success_dwell_sec": 15,
     "register_count": 1,
+    "fail_streak_cooldown_threshold": 0,
+    "fail_streak_cooldown_sec": 600,
     "multi_thread_enabled": False,
     "multi_thread_workers": 4,
     "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
@@ -133,17 +148,27 @@ def validate_config_structure(raw):
         "grok2api_allow_legacy_full_save", "cpa_export_enabled",
         "cpa_copy_to_hotload", "cpa_headless", "cpa_force_standalone",
         "cpa_mint_cookie_inject", "multi_thread_enabled",
+        "cf_turnstile_auto_click",
         "proxy_pool_probe_dual_stack", "proxy_pool_persist_health",
         "proxy_pool_subscription_public_only", "proxy_pool_preflight_enabled",
     )
     for key in bool_keys:
         cfg[key] = _require_bool(cfg, key)
     cfg["register_count"] = _require_int(cfg, "register_count", 1, 2500)
+    cfg["fail_streak_cooldown_threshold"] = _require_int(cfg, "fail_streak_cooldown_threshold", 0, 2500)
+    cfg["fail_streak_cooldown_sec"] = _require_int(cfg, "fail_streak_cooldown_sec", 0, 86400)
+    cfg["clash_rotate_every"] = _require_int(cfg, "clash_rotate_every", 0, 2500)
+    cfg["clash_node_fail_threshold"] = _require_int(cfg, "clash_node_fail_threshold", 1, 10)
+    cfg["clash_node_dead_cooldown_sec"] = _require_int(cfg, "clash_node_dead_cooldown_sec", 0, 3600)
+    cfg["email_entry_block_threshold"] = _require_int(cfg, "email_entry_block_threshold", 1, 50)
+    cfg["email_entry_block_cooldown_sec"] = _require_int(cfg, "email_entry_block_cooldown_sec", 0, 86400)
+    cfg["post_success_dwell_sec"] = _require_int(cfg, "post_success_dwell_sec", 0, 600)
     cfg["multi_thread_workers"] = _require_int(cfg, "multi_thread_workers", 1, 8)
     cfg["proxy_pool_refresh_interval_sec"] = _require_int(cfg, "proxy_pool_refresh_interval_sec", 0, 86400)
     cfg["proxy_pool_probe_interval_sec"] = _require_int(cfg, "proxy_pool_probe_interval_sec", 0, 86400)
     cfg["proxy_pool_probe_timeout_sec"] = _require_int(cfg, "proxy_pool_probe_timeout_sec", 3, 120)
     cfg["proxy_pool_max_concurrent_per_node"] = _require_int(cfg, "proxy_pool_max_concurrent_per_node", 1, 64)
+    cfg["proxy_pool_group_size"] = _require_int(cfg, "proxy_pool_group_size", 1, 50)
     cfg["proxy_pool_acquire_timeout_sec"] = _require_int(cfg, "proxy_pool_acquire_timeout_sec", 1, 600)
     cfg["proxy_protocol_start_timeout_sec"] = _require_int(cfg, "proxy_protocol_start_timeout_sec", 3, 60)
     cfg["proxy_runtime_idle_ttl_sec"] = _require_int(cfg, "proxy_runtime_idle_ttl_sec", 0, 3600)

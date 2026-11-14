@@ -886,6 +886,8 @@ def run_registration_common(count, log_callback, cancel_callback, accounts_outpu
                 persist_account_status=persist_status,
                 registration_run_id=registration_run_id,
                 diagnostics_dir=diagnostics_dir,
+                fail_streak_cooldown_threshold=int(config.get("fail_streak_cooldown_threshold", 0) or 0),
+                fail_streak_cooldown_sec=int(config.get("fail_streak_cooldown_sec", 600) or 600),
             )
         else:
             operations = RegistrationOperations(
@@ -1969,7 +1971,150 @@ def main_cli():
     if command != "start":
         cli_log("[!] 未输入 start，已退出")
         return
+    _install_clash_rotation_hook(cli_log)
     run_registration_cli(count)
+
+
+def _install_clash_rotation_hook(log_callback):
+    """串行模式下的 Clash 钩子：
+    - clash/auto 模式: 每 N 个注册轮换节点 + 失败反馈/探测换新
+    - pool 模式: 只做「链路一级出口健康检查」——住宅链路每一步都经过这个组，
+      节点挂了整条链就是黑洞，所以每次注册前探测，不通自动切候选。
+    """
+    mode = str(config.get("proxy_mode", "auto") or "").strip().lower()
+    every = int(config.get("clash_rotate_every", 0) or 0)
+    group = str(config.get("clash_proxy_group", "") or "").strip()
+    chain_enabled = False
+    if mode == "pool":
+        chain_enabled = True     # pool: 只护栏一级出口
+        node_rotation = False
+    else:
+        node_rotation = every > 0 and bool(group)
+    if not chain_enabled and not node_rotation:
+        return
+    try:
+        import clash_rotate
+        settings = {
+            "clash_api_url": str(config.get("clash_api_url", "") or "").strip(),
+            "clash_api_secret": str(config.get("clash_api_secret", "") or "").strip(),
+            "clash_proxy_group": group,
+            "clash_rotate_nodes": str(config.get("clash_rotate_nodes", "") or "").strip(),
+        }
+        nodes = clash_rotate.list_rotate_nodes(settings)
+    except Exception as exc:
+        log_callback(f"[!] Clash 节点轮换配置无效，本次运行不轮换: {exc}")
+        return
+    if chain_enabled and not node_rotation:
+        log_callback(f"[*] 链路一级健康护栏: 开启 | 组 {group} | 每次注册前探测，候选 {len(nodes)} 个")
+    else:
+        log_callback(f"[*] Clash 节点轮换: 开启 | 组 {group} | 每 {every} 个注册切换一次 | 候选 {nodes[:3]}… 共 {len(nodes)} 个")
+    counter = {"slots": 0}
+    last_node = {"name": None}
+    conn_fail_streak = {"count": 0, "last_node": None}
+    risk_fail_streak = {"count": 0, "last_node": None}
+    FAIL_THRESHOLD = max(1, int(config.get("clash_node_fail_threshold", 2) or 2))
+    DEAD_COOLDOWN = max(0, int(config.get("clash_node_dead_cooldown_sec", 300) or 0))
+
+    def _stuck_wait(reason, log_cb):
+        """轮换走不动（候选全死/只剩当前风控节点）时的等待，避免对同一节点无限重试。"""
+        if DEAD_COOLDOWN <= 0:
+            return
+        log_cb(f"[*] {reason}，冷却 {DEAD_COOLDOWN}s 后复查…")
+        deadline = time.time() + DEAD_COOLDOWN
+        while time.time() < deadline:
+            time.sleep(5)
+
+    def _rotate_between_slots(context=None):
+        ctx = context if isinstance(context, dict) else {}
+        counter["slots"] += 1
+        # pool 模式: 链式前置的一级出口（Clash 组当前节点）也要每次探测，
+        # 挂了立即切到候选里第一个连通的——住代理的整条链都从这里经过。
+        if mode == "pool":
+            try:
+                cur = clash_rotate.current_group_node(settings)
+                live = cur and clash_rotate.probe_node(settings, cur)
+                if not live:
+                    log_callback(f"[*] 链路一级出口 {cur or '(组无当前节点)'} 不通，自动切到探测连通的候选…")
+                    status, node = clash_rotate.emergency_switch(settings, log_callback=log_callback)
+                    if node:
+                        log_callback(f"[*] 链路一级出口已切换: {cur or '(无)'} -> {node}")
+                    else:
+                        log_callback("[!] 链路一级候选也全部不通，本次仍沿用组默认（交给失败反馈与重试）")
+                return
+            except Exception as exc:
+                log_callback(f"[Debug] 链路一级健康检查异常（忽略）: {exc}")
+            return
+        if ctx.get("last_success") is False and last_node["name"]:
+            if ctx.get("entry_blocked"):
+                # 注册入口被 xAI 明确拒绝（IP 风控信号）：拉黑当前节点并跨组紧急探测换 IP
+                clash_rotate.blacklist_node(last_node["name"])
+                conn_fail_streak["count"] = 0
+                log_callback(f"[*] 入口风控反馈: 拉黑 {last_node['name']}，跨组紧急探测其它节点…")
+                status, node = clash_rotate.emergency_switch(settings, log_callback=log_callback)
+                if node and node != last_node["name"]:
+                    last_node["name"] = node
+                elif status == "all_dead" or (node and node == last_node["name"]):
+                    _stuck_wait("入口风控且无其它可探测连通节点", log_callback)
+                return
+            if ctx.get("transport_error"):
+                # 连接级失败：偶发则不动，连续达到阈值判定节点挂 → 探测换新/冷却
+                if conn_fail_streak["last_node"] != last_node["name"]:
+                    conn_fail_streak["count"] = 0
+                    conn_fail_streak["last_node"] = last_node["name"]
+                conn_fail_streak["count"] += 1
+                log_callback(f"[*] 连接级失败 {conn_fail_streak['count']}/{FAIL_THRESHOLD}（节点 {last_node['name']}）")
+                if conn_fail_streak["count"] >= FAIL_THRESHOLD:
+                    conn_fail_streak["count"] = 0
+                    status, node = clash_rotate.emergency_switch(
+                        settings, dead_node=last_node["name"], log_callback=log_callback)
+                    if node:
+                        last_node["name"] = node
+                    elif status == "all_dead" and DEAD_COOLDOWN > 0:
+                        _stuck_wait("全部候选节点连接不通", log_callback)
+                        status2, node2 = clash_rotate.emergency_switch(settings, log_callback=log_callback)
+                        if node2:
+                            last_node["name"] = node2
+                        else:
+                            log_callback("[!] 冷却后复查仍不通，交给熔断器与下一轮反馈继续处理")
+                return
+            # 非连接失败（风控/页面/turnstile）→ 拉黑失败节点 15 分钟
+            clash_rotate.blacklist_node(last_node["name"])
+            conn_fail_streak["count"] = 0
+            log_callback(f"[*] 节点失败反馈: {last_node['name']} 冷却 {clash_rotate.NODE_FAILURE_COOLDOWN_SEC // 60} 分钟")
+            # 风控类失败也可能因 IP 被拉黑名单限死：统计同一节点连续失败次数
+            if risk_fail_streak["last_node"] != last_node["name"]:
+                risk_fail_streak["count"] = 0
+                risk_fail_streak["last_node"] = last_node["name"]
+            risk_fail_streak["count"] += 1
+            if risk_fail_streak["count"] >= max(2, FAIL_THRESHOLD + 1):
+                # 连续多个槽位都败在同一节点 → 主动跨组紧急探测（覆盖其它订阅合并进来的节点）
+                log_callback("[*] 同一节点连续多次非连通失败，疑似 IP 被风控，尝试跨组紧急探测其它节点…")
+                risk_fail_streak["count"] = 0
+                status, node2 = clash_rotate.emergency_switch(settings, log_callback=log_callback)
+                if node2 and node2 != last_node["name"]:
+                    last_node["name"] = node2
+                elif status == "all_dead" or (node2 and node2 == last_node["name"]):
+                    _stuck_wait("跨组也无可探测连通的替代节点", log_callback)
+        elif ctx.get("last_success") is True:
+            conn_fail_streak["count"] = 0
+            risk_fail_streak["count"] = 0
+        if counter["slots"] % every != 0:
+            return
+        prev, node = clash_rotate.rotate_next(settings, log_callback=log_callback)
+        if node and node != last_node["name"]:
+            last_node["name"] = node
+            log_callback(f"[*] Clash 节点已轮换: {prev} -> {node}")
+        elif every > 0 and (clash_rotate.was_all_dead() or not node):
+            # 轮换探测全败或没得换 → 紧急跨组探测；仍无 → 冷却等待
+            log_callback("[*] 常规轮换无可用替代节点，尝试跨组紧急探测…")
+            status, node2 = clash_rotate.emergency_switch(settings, log_callback=log_callback)
+            if node2 and node2 != last_node["name"]:
+                last_node["name"] = node2
+            elif status == "all_dead" or (node2 and node2 == last_node["name"]):
+                _stuck_wait("轮换与紧急探测均无可用替代节点", log_callback)
+
+    from registration_flow import set_pre_slot_hook
+    set_pre_slot_hook(_rotate_between_slots)
 
 
 def main():

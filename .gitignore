@@ -35,3 +35,13 @@ screenshots/
 
 *.pending.jsonl
 *.pending.jsonl.lock
+*.lock
+registration_cooldown.json
+run100.log
+supervisor_console.log
+smoke_final*.log
+pool_test*.log
+test1.log
+test2.log
+test3.log
+test4.log

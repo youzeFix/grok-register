@@ -199,10 +199,81 @@ class _BridgeHandler(socketserver.BaseRequestHandler):
                     pass
 
 
+def dial_via_chain(chain_proxy, host, port, timeout=20):
+    """先经过前置代理隧道到上游（host:port），返回已建立的隧道 socket。
+
+    用于「本地 → 前置出口（如 Clash）→ 住宅代理」的链式场景：
+    住宅池供应商若拒绝来自当前地区/直连出口的连接，可用前置出口完成第一跳。
+    支持 http(s):// 与 socks5:// 前置（都要求提供 CONNECT/CONNECT 隧道语义）。
+    """
+    parsed = parse_proxy_url(chain_proxy)
+    if not parsed or not parsed.hostname:
+        raise ProxyBridgeError("chain_config", "pool_chain_proxy 配置无效")
+    scheme = (parsed.scheme or "http").lower()
+    raw = "%s:%s" % (host, port)
+    if scheme in ("http", "https"):
+        first = socket.create_connection((parsed.hostname, parsed.port or (443 if scheme == "https" else 80)), timeout=timeout)
+        if scheme == "https":
+            try:
+                context = ssl.create_default_context()
+                first = context.wrap_socket(first, server_hostname=parsed.hostname)
+            except Exception as exc:
+                first.close()
+                raise ProxyBridgeError("chain_tls", exc) from exc
+        auth = ""
+        if parsed.username is not None or parsed.password is not None:
+            raw_auth = ("%s:%s" % (urllib.parse.unquote(parsed.username or ""), urllib.parse.unquote(parsed.password or ""))).encode("utf-8")
+            auth = "Proxy-Authorization: Basic %s\r\n" % base64.b64encode(raw_auth).decode("ascii")
+        req = ("CONNECT %s HTTP/1.1\r\nHost: %s\r\n%s\r\n" % (raw, raw, auth)).encode("latin1")
+        try:
+            first.sendall(req)
+            response = _recv_until_headers(first, timeout=timeout)
+            status = response.split(b"\r\n", 1)[0] if response else b""
+            if b" 200 " not in status:
+                raise ProxyBridgeError("chain_connect", status.decode("latin1", "ignore") or "chain CONNECT failed")
+        except ProxyBridgeError:
+            raise
+        except Exception as exc:
+            try:
+                first.close()
+            finally:
+                pass
+            raise ProxyBridgeError("chain_connect", exc) from exc
+        return first
+    if scheme in ("socks5", "socks"):
+        first = socket.create_connection((parsed.hostname, parsed.port or 1080), timeout=timeout)
+        first.sendall(b"\x05\x01\x00")
+        version, method = _recv_exact(first, 2)
+        if version != 0x05 or method != 0x00:
+            raise ProxyBridgeError("chain_auth", "前置 SOCKS5 不支持无鉴权连接")
+        address = None
+        try:
+            address = ipaddress.ip_address(host)
+        except ValueError:
+            address = None
+        if address is None:
+            payload = bytes([0x05, 0x01, 0x00, 0x03]) + bytes([len(raw_host := host.encode("idna"))]) + raw_host + struct.pack(">H", port)
+        else:
+            payload = bytes([0x05, 0x01, 0x00, 0x01 if address.version == 4 else 0x04]) + address.packed + struct.pack(">H", port)
+        first.sendall(payload)
+        reply = _recv_exact(first, 4)
+        if reply[1] != 0x00:
+            raise ProxyBridgeError("chain_connect", "前置 SOCKS5 连接失败 code=%s" % reply[1])
+        if reply[3] == 0x01:
+            _recv_exact(first, 4 + 2)
+        elif reply[3] == 0x03:
+            length = _recv_exact(first, 1)[0]
+            _recv_exact(first, length + 2)
+        elif reply[3] == 0x04:
+            _recv_exact(first, 16 + 2)
+        return first
+    raise ProxyBridgeError("chain_config", "不支持的 pool_chain_proxy 协议: %s" % scheme)
+
+
 class LocalProxyBridge(object):
     """Expose HTTP/HTTPS/SOCKS upstreams as a localhost HTTP proxy."""
 
-    def __init__(self, proxy_url):
+    def __init__(self, proxy_url, chain_proxy=None):
         parsed = parse_proxy_url(proxy_url)
         if not parsed or not parsed.hostname:
             raise ValueError("proxy URL is invalid")
@@ -212,6 +283,7 @@ class LocalProxyBridge(object):
         self.upstream_scheme = scheme
         self.upstream_host = parsed.hostname
         self.upstream_port = safe_proxy_port(parsed) or (443 if scheme == "https" else 1080 if scheme.startswith("socks") else 80)
+        self.chain_proxy = str(chain_proxy or "").strip()
         self.username = urllib.parse.unquote(parsed.username or "")
         self.password = urllib.parse.unquote(parsed.password or "")
         if scheme in ("socks5", "socks5h") and (
@@ -251,6 +323,11 @@ class LocalProxyBridge(object):
         return self.upstream_scheme in ("http", "https")
 
     def open_proxy_socket(self):
+        if self.chain_proxy:
+            try:
+                return dial_via_chain(self.chain_proxy, self.upstream_host, self.upstream_port, timeout=self.timeout)
+            except Exception as exc:
+                raise ProxyBridgeError("chain_connect", exc) from exc
         try:
             sock = socket.create_connection((self.upstream_host, self.upstream_port), timeout=self.timeout)
         except Exception as exc:

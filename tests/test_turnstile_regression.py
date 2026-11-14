@@ -221,7 +221,9 @@ class TurnstileRegressionTests(unittest.TestCase):
             def __init__(self):
                 self.states = iter(["final-page", "not-final-page"])
 
-            def run_js(self, *_args):
+            def run_js(self, script, *_args):
+                if "document.body ? document.body.innerText" in script:
+                    return ""  # 无错误横幅
                 return next(self.states, "not-final-page")
 
             def cookies(self, **_kwargs):
@@ -261,9 +263,10 @@ class TurnstileRegressionTests(unittest.TestCase):
         ]
         sso = source[source.index("def wait_for_sso_cookie("):]
 
-        self.assertNotIn("turnstile.reset", source)
-        self.assertNotIn("MouseEvent.prototype", source)
+        # 官方 reset API 允许（用于卡住组件的重新加载挑战）；
+        # 下面这些才是历史遗留的干扰/伪造模式，必须继续禁止。
         self.assertNotIn("二次复用 Turnstile", source)
+        self.assertNotIn("MouseEvent.prototype", source)
         self.assertNotIn("token.length >= 80", source)
         self.assertNotIn("nativeSetter.call(cfInput", source)
 

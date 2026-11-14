@@ -1,7 +1,10 @@
 """编排 GUI 与 CLI 共用的单账号注册和批量执行流程。"""
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import json
+import os
 import threading
+import time
 import traceback
 from typing import Any, Callable, Dict, Optional, Tuple
 
@@ -22,6 +25,9 @@ from proxy_pool import (
 )
 
 _STAGE_TLS = threading.local()
+
+_FAILURE_STREAK_LOCK = threading.RLock()
+_FAILURE_STREAK_STATE = {"count": 0, "cooldowns": 0}
 
 STAGE_LEASE_ACQUIRE = "lease_acquire"
 STAGE_BROWSER_START = "browser_start"
@@ -77,6 +83,142 @@ def registration_retry_disposition(stage, error=None):
     if stage in (STAGE_ACCOUNT_CONFIRMED, STAGE_POSTPROCESS):
         return NO_RETRY
     return OUTCOME_UNCERTAIN
+
+
+_PRE_SLOT_HOOK = None
+
+
+def set_pre_slot_hook(hook):
+    """Register a callback executed before each registration slot (serial-safe).
+
+    Used for optional proxy-node rotation between registrations. The callback
+    performs its own error handling; engine ignores its return value.
+    """
+    global _PRE_SLOT_HOOK
+    _PRE_SLOT_HOOK = hook
+
+
+def _maybe_run_pre_slot_hook(callbacks, last_success=None, transport_error=False, entry_blocked=False):
+    hook = _PRE_SLOT_HOOK
+    if hook is None:
+        return
+    try:
+        hook({"last_success": last_success, "transport_error": bool(transport_error), "entry_blocked": bool(entry_blocked)})
+    except Exception as exc:
+        callbacks.log(f"[Debug] 注册前置钩子异常（已忽略，不影响注册）: {exc}")
+
+
+def reset_failure_streak_state():
+    """Clear the global consecutive-failure guard (e.g. before a new task)."""
+    with _FAILURE_STREAK_LOCK:
+        _FAILURE_STREAK_STATE["count"] = 0
+        _FAILURE_STREAK_STATE["cooldowns"] = 0
+
+
+_EMAIL_ENTRY_BLOCK_LOCK = threading.Lock()
+_EMAIL_ENTRY_BLOCK_STATE = {"count": 0, "threshold": 3}
+# 记录上一注册槽位的结果，供下一槽位的前置钩子回传（进程级共享，首轮为 False/False）
+_LAST_SLOT_INFO = {"success": False, "transport_error": False}
+
+
+def _note_email_entry_block(callbacks):
+    """同一进程内连续入口拒绝计数；返回 True 表示达到阈值要停止流程。"""
+    with _EMAIL_ENTRY_BLOCK_LOCK:
+        _EMAIL_ENTRY_BLOCK_STATE["count"] += 1
+        if _EMAIL_ENTRY_BLOCK_STATE["count"] >= _EMAIL_ENTRY_BLOCK_STATE["threshold"]:
+            return True
+        callbacks.log(f"[*] 邮箱注册入口拒绝计数: {_EMAIL_ENTRY_BLOCK_STATE['count']}/{_EMAIL_ENTRY_BLOCK_STATE['threshold']}")
+        return False
+
+
+def _reset_email_entry_block():
+    with _EMAIL_ENTRY_BLOCK_LOCK:
+        _EMAIL_ENTRY_BLOCK_STATE["count"] = 0
+
+
+_COOLDOWN_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "registration_cooldown.json")
+
+
+def note_persistent_cooldown(sec, reason=""):
+    """把熔断冷却写到磁盘：引擎被看守器重启后新进程也能感知，避免"无限快速重试"循环。"""
+    try:
+        with open(_COOLDOWN_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"until": time.time() + max(0, int(sec)), "reason": str(reason)[:120]}, f)
+    except Exception:
+        pass
+
+
+def remaining_persistent_cooldown():
+    """返回持久化冷却剩余秒数（无记录或已过期返回 0）。"""
+    try:
+        with open(_COOLDOWN_STATE_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        return max(0, int(float(data.get("until", 0)) - time.time()))
+    except Exception:
+        return 0
+
+
+def clear_persistent_cooldown():
+    try:
+        os.remove(_COOLDOWN_STATE_FILE)
+    except OSError:
+        pass
+    except Exception:
+        pass
+
+
+def _note_registration_failure(callbacks, ops, settings):
+    """Record one failed registration and enforce the consecutive-failure guard.
+
+    The streak is shared across all parallel workers because proxy risk control
+    is per-IP, not per-worker. Returns True when the whole batch must abort.
+    When the threshold is first reached the batch waits out a cooldown; if the
+    streak reaches the threshold again afterwards the batch is aborted.
+    """
+    threshold = int(getattr(settings, "fail_streak_cooldown_threshold", 0) or 0)
+    with _FAILURE_STREAK_LOCK:
+        _FAILURE_STREAK_STATE["count"] += 1
+        count = int(_FAILURE_STREAK_STATE["count"])
+        if threshold <= 0 or count < threshold:
+            return False
+        if int(_FAILURE_STREAK_STATE["cooldowns"]) >= 1:
+            # Cooldown already consumed and the streak built up again: abort.
+            return True
+        _FAILURE_STREAK_STATE["cooldowns"] += 1
+        _FAILURE_STREAK_STATE["count"] = 0
+    cooldown_sec = int(getattr(settings, "fail_streak_cooldown_sec", 600) or 600)
+    note_persistent_cooldown(cooldown_sec, "fail-streak cooldown")
+    callbacks.log(
+        f"[!] 已连续失败 {threshold} 次，疑似当前 IP 暂时被风控，暂停 {cooldown_sec}s 后继续"
+    )
+    waited = 0
+    while waited < cooldown_sec and not callbacks.cancelled():
+        try:
+            ops.sleep(min(30, cooldown_sec - waited))
+        except Exception:
+            break
+        waited += 30
+    callbacks.log("[*] 冷却结束，恢复注册流水线")
+    return False
+
+
+def _note_registration_success():
+    """A confirmed success resets the shared consecutive-failure streak."""
+    with _FAILURE_STREAK_LOCK:
+        _FAILURE_STREAK_STATE["count"] = 0
+    clear_persistent_cooldown()
+    _reset_email_entry_block()
+
+
+def _abort_registration_batch(callbacks, ops, cooldown_sec=600):
+    """Abort the batch after the second consecutive-failure threshold breach."""
+    callbacks.log("[-] 冷却后再次达到连续失败阈值，判定 IP 已被持续风控，中止整个注册流程")
+    # 持久化冷却：看守器重启后的新进程也要先等完这段时间，避免无限快速重试循环
+    note_persistent_cooldown(cooldown_sec, "second breach abort")
+    if callbacks.stop_all is not None:
+        callbacks.stop_all()
+        return True
+    raise ops.cancelled_exception()
 
 
 class EmailSignupUnavailable(RuntimeError):
@@ -165,6 +307,8 @@ class RegistrationSettings:
     enable_nsfw: bool = True
     max_mail_retry: int = 3
     max_slot_retry: int = 3
+    fail_streak_cooldown_threshold: int = 0
+    fail_streak_cooldown_sec: int = 600
     cleanup_interval: int = 5
 
 
@@ -531,6 +675,15 @@ def _run_batch_managed(settings, callbacks, observer, ops):
             attempt_started_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
             attempt_status = "failed"
             attempt_error = None
+            # 上一槽位结果（finally 中记录；首轮默认 False/False）—— last_success/entry_block 回传给前置钩子
+            prev_slot_success = _LAST_SLOT_INFO["success"]
+            prev_transport_error = _LAST_SLOT_INFO["transport_error"]
+            _maybe_run_pre_slot_hook(
+                callbacks,
+                last_success=prev_slot_success if result.processed_count else None,
+                transport_error=prev_transport_error and not prev_slot_success,
+                entry_blocked=_EMAIL_ENTRY_BLOCK_STATE["count"] > 0 and not prev_slot_success,
+            )
             account = None
             output = None
             continue_batch = True
@@ -559,6 +712,8 @@ def _run_batch_managed(settings, callbacks, observer, ops):
                 elif feedback_kind in ("compatibility", "configuration"):
                     callbacks.log("[Debug] 后处理属于本地兼容/配置错误，不计入代理传输健康度")
                 slot_success = bool(account and account.ok); retry_count_for_slot = 0
+                if slot_success:
+                    _note_registration_success()
                 last_cleanup_success_count = _record_success(result, settings, callbacks, ops, account, output, last_cleanup_success_count)
             except ProxyAcquireCancelled as exc:
                 attempt_status = "cancelled"; attempt_error = exc
@@ -594,10 +749,35 @@ def _run_batch_managed(settings, callbacks, observer, ops):
             except EmailSignupUnavailable as exc:
                 attempt_status = "rejected"; attempt_error = exc
                 result.fail_count += 1; result.processed_count += 1; retry_count_for_slot = 0
-                callbacks.log(f"[-] 邮箱注册被 xAI 页面明确拒绝，停止本批次以免反复提交: {exc}")
-                if callbacks.stop_all is not None:
-                    callbacks.stop_all()
-                continue_batch = False
+                # 池模式：把刚被拒绝的出口 IP 加入 affinity 临时排除，让下一次 acquire 换新 IP
+                try:
+                    _rejected = current_proxy_lease()
+                    if _rejected is not None and _rejected.affinity and not str(_rejected.affinity).startswith("grp:none"):
+                        get_manager().exclude_sticky_for_node(_rejected.affinity, _rejected.node_id)
+                except Exception:
+                    pass
+                # 入口拒绝（如 "Email sign-up isn't available right now"）= xAI 侧全局/网段级
+                # 邮箱注册暂停：独立阈值计数（email_entry_block_threshold），达到后停止并进入
+                # 专属持久冷却（email_entry_block_cooldown_sec，默认 20 分钟），
+                # 避免在 xAI 关闭邮箱注册的时段继续空烧接码邮箱。
+                try:
+                    entry_threshold = max(1, int(app_config.get("email_entry_block_threshold", 3) or 3))
+                except Exception:
+                    entry_threshold = 3
+                _EMAIL_ENTRY_BLOCK_STATE["threshold"] = entry_threshold
+                if _note_email_entry_block(callbacks):
+                    callbacks.log("[-] 连续多个节点都出现邮箱注册入口拒绝，判定邮箱注册入口已被 xAI 关闭，停止流程")
+                    try:
+                        entry_cooldown = int(app_config.get("email_entry_block_cooldown_sec", 1200) or 1200)
+                    except Exception:
+                        entry_cooldown = 1200
+                    note_persistent_cooldown(entry_cooldown, "email entry blocked globally")
+                    callbacks.log(f"[*] 入口关闭冷却 {entry_cooldown}s：期间看守器/新进程不再尝试，避免空烧接码邮箱")
+                    if callbacks.stop_all is not None:
+                        callbacks.stop_all()
+                    continue_batch = False
+                else:
+                    callbacks.log("[!] 邮箱注册入口被当前 IP 拒绝，将切换节点/换 IP 后再试")
             except RegistrationRiskDenied as exc:
                 attempt_status = "rejected"; attempt_error = exc
                 result.fail_count += 1; result.processed_count += 1; retry_count_for_slot = 0
@@ -657,15 +837,40 @@ def _run_batch_managed(settings, callbacks, observer, ops):
                     callbacks, slot_index, attempt_index, attempt_started_at,
                     account, output, attempt_status, attempt_error, ops,
                 )
+                _LAST_SLOT_INFO["success"] = slot_success
+                _LAST_SLOT_INFO["transport_error"] = bool(transport_error)
                 _notify_observer(observer, result, account, output, callbacks)
-            if not continue_batch or result.cancelled: break
+            if not continue_batch or result.cancelled:
+                break
+            if not slot_success and not callbacks.cancelled():
+                # Shared consecutive-failure guard: count this failed slot and
+                # either cool down (first breach) or abort the whole batch.
+                if _note_registration_failure(callbacks, ops, settings):
+                    if _abort_registration_batch(callbacks, ops, cooldown_sec=int(getattr(settings, "fail_streak_cooldown_sec", 600) or 600)):
+                        break
     finally:
         _run_cleanup_safely(ops, callbacks, "任务结束")
     return result
 
 
-def run_batch(count, callbacks, observer, ops, enable_nsfw=True, cleanup_interval=5, max_slot_retry=3, max_mail_retry=3, settings=None):
+def run_batch(count, callbacks, observer, ops, enable_nsfw=True, cleanup_interval=5, max_slot_retry=3, max_mail_retry=3, settings=None, fail_streak_cooldown_threshold=0, fail_streak_cooldown_sec=600):
     if settings is None:
-        settings = RegistrationSettings(count=int(count), enable_nsfw=bool(enable_nsfw), cleanup_interval=int(cleanup_interval), max_slot_retry=int(max_slot_retry), max_mail_retry=int(max_mail_retry))
+        settings = RegistrationSettings(count=int(count), enable_nsfw=bool(enable_nsfw), cleanup_interval=int(cleanup_interval), max_slot_retry=int(max_slot_retry), max_mail_retry=int(max_mail_retry), fail_streak_cooldown_threshold=int(fail_streak_cooldown_threshold), fail_streak_cooldown_sec=int(fail_streak_cooldown_sec))
+    # 本批次独立的状态：入口拒绝计数 / 上一槽位结果
+    _reset_email_entry_block()
+    _LAST_SLOT_INFO["success"] = False
+    _LAST_SLOT_INFO["transport_error"] = False
+    # 进程重启后先吞掉上一进程留下的熔断冷却，避免"无限快速重试"循环
+    remaining = remaining_persistent_cooldown()
+    if remaining > 0:
+        callbacks.log(f"[!] 检测到遗留熔断冷却 {remaining}s（上一进程写入磁盘），等待后继续")
+        waited = 0
+        while waited < remaining and not callbacks.cancelled():
+            try:
+                ops.sleep(min(30, remaining - waited))
+            except Exception:
+                break
+            waited += 30
+        callbacks.log("[*] 遗留冷却等待结束，继续")
     # All modes share the same stage-aware retry engine. begin_registration_slot() is a no-op when the proxy manager is unmanaged.
     return _run_batch_managed(settings, callbacks, observer, ops)

@@ -31,6 +31,8 @@ class PreSubmitBrowserRetryTests(unittest.TestCase):
             create=True,
         ), patch.object(
             registration_browser, "raise_if_cancelled", return_value=None, create=True
+        ), patch.object(
+            registration_browser, "sleep_with_cancel", return_value=None, create=True
         ):
             with self.assertRaisesRegex(ConfigError, "mail provider configuration"):
                 registration_browser.fill_email_and_submit()
@@ -42,6 +44,8 @@ class PreSubmitBrowserRetryTests(unittest.TestCase):
             create=True,
         ), patch.object(
             registration_browser, "raise_if_cancelled", return_value=None, create=True
+        ), patch.object(
+            registration_browser, "sleep_with_cancel", return_value=None, create=True
         ):
             with self.assertRaisesRegex(RecoverablePreSubmitError, "temporary mailbox outage"):
                 registration_browser.fill_email_and_submit()

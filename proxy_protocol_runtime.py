@@ -184,7 +184,8 @@ class ProtocolRuntimeManager:
         raise ProxyRuntimeError("sing-box startup failed after 4 attempts: %s" % "; ".join(errors))
 
     def _start_bridge_entry(self, descriptor):
-        bridge = LocalProxyBridge(descriptor.canonical_uri)
+        chain = str(self.config.get("pool_chain_proxy") or "").strip()
+        bridge = LocalProxyBridge(descriptor.canonical_uri, chain_proxy=chain)
         try:
             endpoint = bridge.start()
         except Exception as exc:
@@ -256,6 +257,8 @@ class ProtocolRuntimeManager:
 
     def _acquire_runtime_entry(self, descriptor, starter):
         while True:
+            stale = []
+            endpoint = runtime_key = None
             with self._condition:
                 stale = self._cleanup_locked()
                 current = self._entries.get(descriptor.node_id)

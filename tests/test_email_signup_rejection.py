@@ -48,6 +48,8 @@ class EmailSignupRejectionTests(unittest.TestCase):
             def run_js(self, script, *_args):
                 if "const email = arguments[0]" in script:
                     return json.dumps({"state": "not-ready", "url": "https://accounts.x.ai/sign-up"})
+                if "inputs.some" in script:
+                    return True
                 if "document.body ? document.body.innerText" in script:
                     return REJECTION
                 raise AssertionError("email entry should not be clicked again")
@@ -66,6 +68,8 @@ class EmailSignupRejectionTests(unittest.TestCase):
             def run_js(self, script, *_args):
                 if "const email = arguments[0]" in script:
                     return json.dumps({"state": "filled"})
+                if "inputs.some" in script:
+                    return True
                 if "return (input.getAttribute('type')" in script:
                     return True
                 if "const submitButton = buttons.find" in script:
@@ -89,12 +93,16 @@ class EmailSignupRejectionTests(unittest.TestCase):
             def run_js(self, script, *_args):
                 if "const email = arguments[0]" in script:
                     return json.dumps({"state": "filled"})
+                if "inputs.some" in script:
+                    return True
                 if "return (input.getAttribute('type')" in script:
                     return True
                 if "const submitButton = buttons.find" in script:
                     return "clicked"
                 if "document.body ? document.body.innerText" in script:
                     return "Check your inbox"
+                if "otp: otpInput" in script:
+                    return json.dumps({"url": "https://accounts.x.ai/check-email", "otp": True})
                 raise AssertionError("unexpected browser script")
 
         with patch.object(registration_browser, "page", Page()), \
@@ -135,13 +143,14 @@ class EmailSignupRejectionTests(unittest.TestCase):
                     observer=lambda *args: observations.append(args),
                     ops=ops, enable_nsfw=False,
                 )
-            self.assertEqual((result.processed_count, result.fail_count, result.uncertain_count), (1, 1, 0))
+            self.assertEqual((result.processed_count, result.fail_count, result.uncertain_count), (3, 3, 0))
             self.assertEqual(result.success_count, 0)
-            self.assertEqual(len(observations), 1)
-            self.assertNotIn("restart", fake.events)
-            self.assertTrue(any("停止本批次" in entry for entry in logs))
+            self.assertEqual(len(observations), 3)
+            # 新语义：入口拒绝 → 换节点继续；连续 threshold 次后才停止（期间会重启浏览器刷新 IP）
+            self.assertTrue(any("停止流程" in entry for entry in logs))
             signal.assert_called_once_with()
-            release.assert_called_once_with(success=False, transport_error=None)
+            release.assert_called_with(success=False, transport_error=None)
+            self.assertEqual(release.call_count, 3)  # 每个被拒绝的槽位都释放了租约
 
 
 if __name__ == "__main__":

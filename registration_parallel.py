@@ -74,7 +74,8 @@ def run_parallel_batch(count, callbacks, observer, runtime_namespace, accounts_o
                        workers=4, enable_nsfw=True, cleanup_interval=5,
                        max_slot_retry=3, max_mail_retry=3, persist_account_record=None,
                        persist_account_status=None, registration_run_id=None,
-                       diagnostics_dir=None):
+                       diagnostics_dir=None,
+                       fail_streak_cooldown_threshold=0, fail_streak_cooldown_sec=600):
     worker_counts = split_worker_counts(count, workers)
     if len(worker_counts) <= 1:
         raise ValueError("parallel batch requires at least two active workers")
@@ -241,6 +242,8 @@ def run_parallel_batch(count, callbacks, observer, runtime_namespace, accounts_o
                 cleanup_interval=int(cleanup_interval),
                 max_slot_retry=int(max_slot_retry),
                 max_mail_retry=int(max_mail_retry),
+                fail_streak_cooldown_threshold=int(fail_streak_cooldown_threshold),
+                fail_streak_cooldown_sec=int(fail_streak_cooldown_sec),
             )
             with stats_lock:
                 snapshots[worker_id] = _summary_copy(batch)

@@ -284,6 +284,13 @@ class ProxyPoolManager:
         self._source_diagnostics = {}
         self._persisted_state = self._load_state_file()
         self._runtime = ProtocolRuntimeManager(self.config, log=self.log)
+        # affinity 分组的显式粘性映射: affinity -> node_id。
+        # 配合供应商粘性会话(如 IPWO sid)实现"一组账号同一住宅 IP"；
+        # 选定后不再依赖哈希/选择的瞬时状态，直到该节点失败或不可用才重选。
+        self._sticky_groups = {}
+        # affinity 级临时排除: affinity -> (node_id, 边缘时间戳)。
+        # 用于"该节点刚发生入口/风控拒绝"的场景：重选时跳过它，加速换 IP。
+        self._sticky_exclusion = {}
         self.reload_sources(force=True)
 
     @property
@@ -561,9 +568,8 @@ class ProxyPoolManager:
         ]
 
     def _probe_tier(self, node, now):
-        freshness = max(60, (self.probe_interval * 2) if self.probe_interval > 0 else 300)
-        if not node.last_probed_at or now - node.last_probed_at > freshness:
-            return 1
+        # 注意: 不要按 last_probed_at 新鲜度分层——probe_status 本身会在重探测时更新，
+        # 新鲜度分层会让选择池在探测过期时悄悄漂移，破坏 affinity 分组的确定性。
         if node.probe_status == "healthy":
             return 0
         if node.probe_status == "unhealthy":
@@ -617,6 +623,8 @@ class ProxyPoolManager:
                     node.failure_count += 1
                     node.cooldown_until = time.time() + min(60, 5 * (2 ** min(node.failure_count - 1, 4)))
                 node.last_error = "%s: %s" % ("configuration" if permanent else "backend", safe_proxy_error_text(error)[:260])
+            # 节点级故障：清掉指向它的 affinity 粘性映射，让组在下一次 acquire 重新选
+            self._sticky_groups = {a: nid for a, nid in self._sticky_groups.items() if nid != node_id}
             self._condition.notify_all()
         self._save_state_file()
 
@@ -635,7 +643,21 @@ class ProxyPoolManager:
                         raise ProxyAcquireCancelled("代理租约等待已取消")
                     now = time.time(); eligible = self._eligible_locked(now)
                     if eligible:
-                        selected = self._select_locked(eligible, affinity); selected.inflight += 1; break
+                        exclusion = self._sticky_exclusion.get(affinity)
+                        if exclusion is not None:
+                            excl_node, excl_until = exclusion
+                            if now >= excl_until:
+                                self._sticky_exclusion.pop(affinity, None)
+                            elif excl_node in {n.id for n in eligible} and len(eligible) > 1:
+                                eligible = [n for n in eligible if n.id != excl_node]
+                        eligible_ids = {n.id for n in eligible}
+                        sticky_id = self._sticky_groups.get(affinity)
+                        if sticky_id is not None and sticky_id in eligible_ids:
+                            selected = next(n for n in eligible if n.id == sticky_id)
+                        else:
+                            selected = self._select_locked(eligible, affinity)
+                            self._sticky_groups[affinity] = selected.id
+                        selected.inflight += 1; break
                     active_nodes = [node for node in self._nodes.values() if node.enabled and not node.retired]
                     if not active_nodes:
                         fallback_reason = "empty"
@@ -676,6 +698,20 @@ class ProxyPoolManager:
                 node.inflight = max(0, node.inflight - 1)
                 if node.retired and node.inflight == 0: self._nodes.pop(node.id, None)
             self._condition.notify_all()
+
+    def exclude_sticky_for_node(self, affinity, node_id, duration=240):
+        """业务级拒绝（如注册入口风控）反馈：让该 affinity 下次 acquire 换一个节点/IP。
+
+        与节点级故障(_rollback/_apply_transport_failure)不同——节点本身仍"健康"，
+        只是当前会话的出口 IP 刚被 xAI 拒绝，需要尽快离开该 IP。
+        """
+        if node_id in ("direct", "fallback-single"):
+            return
+        with self._condition:
+            self._sticky_groups.pop(affinity, None)
+            self._sticky_exclusion[affinity] = (node_id, time.time() + max(30, int(duration or 0)))
+            self._condition.notify_all()
+        self.log("[*] affinity 重选: 排除刚被拒绝的出口 IP (node=%s) 后换新会话" % str(node_id)[:20])
 
     def _count_feedback_sample(self, node, lease):
         if lease is not None and lease.feedback_sampled:
@@ -728,7 +764,9 @@ class ProxyPoolManager:
                 node.failure_count += 1; node.health = max(0.05, node.health * 0.7)
                 cooldown = min(600, 30 * (2 ** min(max(node.failure_count - 1, 0), 4)))
                 node.cooldown_until = time.time() + cooldown; node.last_error = "transport"; node_for_probe = node.id
-                self._condition.notify_all()
+            # 节点级故障：清掉指向它的 affinity 粘性映射，让组在下一次 acquire 重新选 IP
+            self._sticky_groups = {a: nid for a, nid in self._sticky_groups.items() if nid != node_id}
+            self._condition.notify_all()
         self._save_state_file()
         if node_for_probe and schedule_probe: self._schedule_failure_probe(node_for_probe)
 
@@ -822,6 +860,9 @@ class ProxyPoolManager:
                 node.exit_ip = chosen.exit_ip if status == "healthy" else ""
                 if status == "healthy":
                     node.enabled = True
+                    # 探测健康即视为可信，否则残留的低 health 会让 _select_locked
+                    # 退化为"择优"而非哈希选定，破坏 affinity 分组语义
+                    node.health = max(node.health, 0.9)
                     if node.last_error == "transport" or node.last_error.startswith("backend:"):
                         if not node.rotating:
                             node.health = 1.0; node.failure_count = 0; node.cooldown_until = None
@@ -959,7 +1000,16 @@ def begin_registration_slot(slot_index, attempt_index=1, worker_key=None, log=No
     manager = get_manager(log=log)
     if not manager.managed: return None
     worker = str(worker_key or threading.current_thread().name or "worker"); slot = int(slot_index); attempt = int(attempt_index)
-    affinity = "%s:slot:%s" % (worker, slot)
+    try:
+        group_size = int((getattr(manager, "config", {}) or {}).get("proxy_pool_group_size", 1) or 1)
+    except Exception:
+        group_size = 1
+    if group_size > 1:
+        # 每组 N 个注册共享一个 affinity → _select_locked 哈希出同一节点（同一会话/IP），
+        # 配合供应商粘性会话实现「一组账号同一住宅 IP」，组与组之间自然切换。
+        affinity = "grp:%d" % ((max(1, slot) - 1) // group_size)
+    else:
+        affinity = "%s:slot:%s" % (worker, slot)
     session_seed = "%s:%s:%s:%s" % (worker, slot, attempt, secrets.token_hex(8))
     session_key = hashlib.sha256(session_seed.encode("utf-8")).hexdigest()[:16]
     lease = manager.acquire(affinity=affinity, worker_key=worker, slot_index=slot, attempt_index=attempt, session_key=session_key, cancel_callback=cancel_callback)

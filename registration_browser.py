@@ -24,6 +24,8 @@ TURNSTILE_LOADING = "LOADING"
 TURNSTILE_WAITING = "WAITING"
 TURNSTILE_SOLVED = "SOLVED"
 TURNSTILE_FAILED = "FAILED"
+MAX_TURNSTILE_AUTO_CLICKS = 12
+TURNSTILE_AUTO_CLICK_INTERVAL = 6.0
 
 
 def _mark_registration_stage(stage):
@@ -60,6 +62,10 @@ def _run_pre_submit_js(script, *args):
         if _is_pre_submit_js_transient(exc):
             raise AccountRetryNeeded(f"提交前浏览器 JS 暂时失败: {exc}") from exc
         raise
+
+
+config = {}
+"""运行配置（由宿主 bind_runtime 注入；独立调用时退回空配置，关闭可选功能）。"""
 _OWN_NAMES = {'is_cloudflare_block_response', 'response_preview', 'start_browser', 'enable_nsfw_for_token', 'stop_browser_proxy_bridge', 'set_tos_accepted', 'fill_email_and_submit', 'getTurnstileToken', 'set_birth_date', 'generate_random_birthdate', 'fill_profile_and_submit', 'click_email_signup_button', 'wait_for_sso_cookie', 'fill_code_and_submit', 'build_profile', 'cleanup_runtime_memory', 'open_signup_page', 'stop_browser', 'encode_grpc_nsfw_settings', 'restart_browser', 'has_profile_form', 'update_nsfw_settings', 'refresh_active_page'}
 
 
@@ -249,6 +255,14 @@ def start_browser(log_callback=None, use_proxy=True):
     global browser, page, browser_proxy_bridge, browser_started_with_proxy
     _mark_registration_stage("browser_start")
     last_exc = None
+    # 先清掉孤儿浏览器（引擎被 kill 后 Chrome 遗留会造成"并发1却两个浏览器"）
+    try:
+        from browser_runtime import sweep_orphan_browsers
+        orphans = sweep_orphan_browsers()
+        if orphans and log_callback:
+            log_callback(f"[*] 启动前清理遗留浏览器: pid={orphans}")
+    except Exception:
+        pass
     proxy_enabled = bool(use_proxy and get_configured_proxy())
     for attempt in range(1, 5):
         bridge = None
@@ -340,8 +354,50 @@ def refresh_active_page():
         restart_browser()
     return page
 
+def _raise_if_xai_page_error(log_callback=None):
+    """通用 xAI 错误页/错误横幅探测（"Something went wrong"系）。
+
+    这些错误表示服务端拒绝/异常——当前账号提交前应中止流程快速重试，
+    而不是乐观进入下一步（邮箱陷阱：等一封永远不会来的验证码）。
+    """
+    if page is None:
+        return
+    try:
+        run_js = getattr(page, "run_js", None)
+        if not callable(run_js):
+            return
+        text = run_js("return document.body ? document.body.innerText : '';")
+        if not isinstance(text, str):
+            return
+    except (AttributeError, TypeError, ContextLostError, JavaScriptError):
+        return
+    visible = " ".join(str(text or "").lower().replace("’", "'").split())
+    markers = (
+        ("server-error", "something went wrong"),
+        ("server-error", "refresh the page and try again"),
+        ("server-error", "still stuck? contact support"),
+        ("rate-limit", "too many requests"),
+        ("rate-limit", "rate limit"),
+        ("server-error", "unexpected error"),
+        ("server-error", "internal server error"),
+        ("server-error", "application error"),
+        ("server-error", "an error occurred while processing"),
+        ("server-error", "请求处理出错"),
+        ("server-error", "发生错误"),
+    )
+    for kind, marker in markers:
+        if marker in visible:
+            from registration_flow import RecoverablePreSubmitError
+            message = f"xAI 页面错误({kind}): {marker}（按可重试错误处理，快速失败）"
+            if log_callback:
+                log_callback(f"[!] 检测到页面错误标记: {marker}")
+            raise RecoverablePreSubmitError(message)
+
+
 def _raise_if_email_signup_unavailable():
     """Stop only when the visible xAI signup page explicitly refuses email registration."""
+    if page is None:
+        return
     try:
         text = page.run_js("return document.body ? document.body.innerText : '';")
     except (ContextLostError, JavaScriptError, PageDisconnectedError):
@@ -355,7 +411,7 @@ def _raise_if_email_signup_unavailable():
         )
 
 
-def click_email_signup_button(timeout=10, log_callback=None, cancel_callback=None):
+def click_email_signup_button(timeout=30, log_callback=None, cancel_callback=None):
     global page
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -423,7 +479,7 @@ return candidates[0].text || true;
         log_callback(f"[Debug] 页面内容片段: {page_html}")
 
     from registration_flow import RecoverablePreSubmitError
-    raise RecoverablePreSubmitError("未找到「使用邮箱注册」按钮")
+    raise RecoverablePreSubmitError("未找到「使用邮箱注册」按钮（页面水合缓慢或入口异常，已按可重试处理）")
 
 def open_signup_page(log_callback=None, cancel_callback=None):
     global browser, page
@@ -438,7 +494,7 @@ def open_signup_page(log_callback=None, cancel_callback=None):
         global page
         try:
             page = browser.get_tab(0)
-            page.get(SIGNUP_URL)
+            page.get(SIGNUP_URL, retry=1, interval=1, timeout=45)
         except Exception as e:
             if log_callback:
                 log_callback(f"[Debug] 打开URL异常: {e}")
@@ -537,6 +593,47 @@ def fill_email_and_submit(timeout=45, log_callback=None, cancel_callback=None, o
     _mark_registration_stage("page_open")
     raise_if_cancelled(cancel_callback)
     email = dev_token = ""
+    # 关键：先确认邮箱表单已经出现，再创建邮箱（下订单）。
+    # xAI 关闭邮箱注册入口时，点击「Sign up with email」不会跳转——此时下单会白白烧掉一单。
+    # 等待上限 20s（住宅链路下水合慢）；期间顺带检测入口拒绝提示，出现则立即快速失败（不产生邮箱订单）。
+    # 仅在有浏览器上下文时执行；离线/测试环境（page=None）直接走原有下单路径。
+    form_seen = False
+    if page is not None:
+        form_deadline = time.time() + 20
+        while time.time() < form_deadline:
+            raise_if_cancelled(cancel_callback)
+            try:
+                seen = _run_pre_submit_js(
+                    """
+function isVisible(node) {
+    if (!node) return false;
+    const style = window.getComputedStyle(node);
+    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+    const rect = node.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 5;
+}
+const inputs = Array.from(document.querySelectorAll('input')).filter(isVisible);
+return inputs.some((node) => {
+    const t = ((node.getAttribute('type') || '') + ' ' + (node.getAttribute('name') || '') + ' ' +
+               (node.getAttribute('data-testid') || '') + ' ' + (node.getAttribute('autocomplete') || '') + ' ' +
+               (node.getAttribute('placeholder') || '')).toLowerCase();
+    return t.includes('email');
+});
+""")
+            except Exception:
+                seen = False
+            if seen:
+                form_seen = True
+                break
+            # 表单未出现才检查入口拒绝提示（表单可见时不得让 banner 抢先判决）
+            _raise_if_email_signup_unavailable()
+            sleep_with_cancel(1, cancel_callback)
+        if not form_seen:
+            _raise_if_email_signup_unavailable()
+            if log_callback:
+                log_callback("[!] 点击注册入口后邮箱表单未出现（疑似 xAI 关闭邮箱注册），快速失败，不下邮箱单")
+            from registration_flow import EmailSignupUnavailable
+            raise EmailSignupUnavailable("xAI 邮箱注册入口未跳转到邮箱表单（入口不可用）")
     try:
         email, dev_token = get_email_and_token()
         if not email or not dev_token:
@@ -844,8 +941,51 @@ return 'enter';
             if log_callback:
                 detail = f" ({clicked})" if isinstance(clicked, str) else ""
                 log_callback(f"[*] 已触发邮箱提交，尚未确认服务端接受: {email}{detail}")
-            sleep_with_cancel(1, cancel_callback)
-            _raise_if_email_signup_unavailable()
+            # 提交后必须确认页面真正进入验证码/等待环节——否则白等一封不会来的验证码。
+            # 也顺带覆盖 "Something went wrong. Refresh the page and try again." 类错误页。
+            confirm_deadline = time.time() + 20
+            confirmed = False
+            last_error = ""
+            while time.time() < confirm_deadline:
+                raise_if_cancelled(cancel_callback)
+                try:
+                    _raise_if_xai_page_error(log_callback=log_callback)
+                    _raise_if_email_signup_unavailable()
+                except Exception as exc:
+                    last_error = str(exc); raise
+                # 页面转移成功判据：URL 变为 check-email/verify 类，或出现 OTP 输入框
+                status = page.run_js(
+                    """
+function isVisible(node) {
+    if (!node) return false;
+    const style = window.getComputedStyle(node);
+    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+    const rect = node.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+}
+const otpInput = Array.from(document.querySelectorAll("input[data-input-otp='true'], input[autocomplete='one-time-code'], input[inputmode='numeric']")).some(isVisible);
+return JSON.stringify({ url: location.href, otp: otpInput });
+                    """
+                )
+                try:
+                    detail = json.loads(status) if isinstance(status, str) and status.strip().startswith("{") else {"url": "", "otp": False}
+                except Exception:
+                    detail = {"url": "", "otp": False}
+                url_now = str(detail.get("url") or "")
+                otp_now = bool(detail.get("otp"))
+                lowered = url_now.lower()
+                if otp_now or any(k in lowered for k in ("check-email", "/verify", "verification", "confirm")):
+                    confirmed = True
+                    if log_callback:
+                        log_callback("[*] 邮箱提交已确认，页面已进入验证码环节")
+                    break
+                sleep_with_cancel(1, cancel_callback)
+            if not confirmed:
+                if last_error:
+                    raise last_error if isinstance(last_error, Exception) else Exception(last_error)
+                raise Exception(
+                    "邮箱已提交但 20s 内未确认进入验证码环节（页面未跳转或出现异常错误页），按可疑提交处理"
+                )
             return email, dev_token
         # JS explicitly reported no click/submission, so a later failure is
         # still safe to restart. An exception during JS remains ambiguous.
@@ -923,6 +1063,7 @@ return otpBoxes.length >= code.length ? 'boxes' : 'not-ready';
             clean_code,
         )
         if ready == "not-ready":
+            _raise_if_xai_page_error(log_callback=log_callback)
             sleep_with_cancel(0.5, cancel_callback)
             continue
         _mark_registration_stage("code_submit")
@@ -1038,6 +1179,7 @@ return 'clicked';
             transition_deadline = min(deadline, time.time() + max(1.0, float(transition_timeout)))
             while time.time() < transition_deadline:
                 raise_if_cancelled(cancel_callback)
+                _raise_if_xai_page_error(log_callback=log_callback)
                 if has_profile_form(log_callback=log_callback):
                     if log_callback:
                         log_callback("[*] 验证码提交已确认，资料页已出现")
@@ -1136,6 +1278,20 @@ try {
   else if (failed) state = 'FAILED';
   else if (input || iframe) state = 'WAITING';
   else if (widget) state = 'LOADING';
+  else {
+    // 页面明确提示需要完成挑战但组件未渲染/未加载 → 同样按 WAITING 处理，
+    // 让外层走等待+重置逻辑，而不是反复点击提交按钮。
+    const bodyText = document.body ? String(document.body.innerText).toLowerCase() : '';
+    const challengeRequired = [
+      'complete the verification challenge',
+      'complete the challenge',
+      'verification challenge',
+      '完成人机验证',
+      '完成验证挑战',
+      '请完成验证',
+    ].some((marker) => bodyText.includes(marker));
+    if (challengeRequired) state = 'WAITING';
+  }
 
   return JSON.stringify({
     state,
@@ -1187,6 +1343,118 @@ try {
     }
 
 
+def _get_turnstile_widget_rect():
+    """返回 Turnstile 可交互组件的页面坐标矩形；找不到时返回 None。"""
+    if page is None:
+        return None
+    try:
+        rect = page.run_js(
+            """
+function pickRect(el) {
+  if (!el) return null;
+  const r = el.getBoundingClientRect();
+  return {left: r.left, top: r.top, width: r.width, height: r.height};
+}
+return (function () {
+  const choices = [
+    'iframe[src*="turnstile"]',
+    'div.cf-turnstile',
+    '[data-sitekey]',
+  ];
+  for (const sel of choices) {
+    const rect = pickRect(document.querySelector(sel));
+    if (rect && rect.width > 0 && rect.height > 0) return rect;
+  }
+  return null;
+})();
+"""
+        )
+        if rect and float(rect.get("width") or 0) > 0:
+            return rect
+    except Exception:
+        return None
+    return None
+
+
+def _attempt_turnstile_click(log_callback=None):
+    """尝试自动点击 Turnstile 复选框；优先穿透 iframe 点真实元素，其次组件坐标点击。"""
+    if page is None:
+        return False
+    # 方案 1: 穿透 challenges iframe，直接点击复选框（真实鼠标事件）
+    for loc in ('css:iframe[src*="challenges.cloudflare.com"]', 'css:iframe[src*="turnstile"]'):
+        try:
+            iframe_ele = page.ele(loc, timeout=2)
+            if iframe_ele is None:
+                continue
+            frame = page.get_frame(iframe_ele)
+            if frame is None:
+                continue
+            box = frame.ele('css:input[type="checkbox"]', timeout=1)
+            if box is None:
+                box = frame.ele('css:label[@for]', timeout=1)
+            if box is not None:
+                box.click()
+                if log_callback:
+                    log_callback("[*] 已穿透 iframe 直接点击 Turnstile 复选框元素")
+                return True
+        except Exception as exc:
+            if log_callback:
+                log_callback(f"[Debug] 穿透 iframe 点击未执行: {exc}")
+    # 方案 2: 组件矩形坐标点击（move_to 组件中心 + 相对偏移到复选框位置）
+    rect = _get_turnstile_widget_rect()
+    if not rect:
+        return False
+    left = float(rect["left"]); top = float(rect["top"])
+    width = float(rect["width"]); height = float(rect["height"])
+    # 复选框位于组件左侧；组件过窄(非交互)时不点击。
+    if width < 60 or height < 20:
+        return False
+    target_x = left + min(30.0, width * 0.35)
+    target_y = top + height / 2.0
+    try:
+        from DrissionPage.common import Actions
+        actions = page.actions
+        widget = page.ele('css:div.cf-turnstile') or page.ele('css:iframe[src*="turnstile"]')
+        if widget is not None:
+            actions.move_to(widget)
+            dx = int(round(target_x - (left + width / 2)))
+            dy = int(round(target_y - (top + height / 2)))
+            actions.move(dx, dy, duration=0.25).click()
+            if log_callback:
+                log_callback(f"[*] 已按组件相对偏移点击 Turnstile 复选框 (坐标 {target_x:.0f}x{target_y:.0f})")
+            return True
+        actions.move(int(round(target_x)), int(round(target_y)), duration=0.25).click()
+        if log_callback:
+            log_callback(f"[*] 已按页面坐标点击 Turnstile 复选框区域 ({target_x:.0f}x{target_y:.0f})")
+        return True
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[Debug] 自动点击 Turnstile 未执行: {exc}")
+        return False
+
+
+def _reset_turnstile_widget(log_callback=None):
+    """通过 turnstile API 重置组件，强制其重新加载挑战。"""
+    if page is None:
+        return False
+    reset_js = """
+try {
+  if (window.turnstile && typeof window.turnstile.reset === 'function') {
+    window.turnstile.reset();
+    return 'reset-ok';
+  }
+  return 'no-api';
+} catch (e) { return 'error:' + e.message; }
+"""
+    try:
+        result = page.run_js(reset_js)
+        if log_callback and result == "reset-ok":
+            log_callback("[*] 已执行 Turnstile 组件重置（重新加载挑战）")
+        return result == "reset-ok"
+    except Exception:
+        return False
+
+
 def _wait_for_turnstile(log_callback=None, cancel_callback=None, timeout=60):
     """等待 Turnstile 自动完成或由用户在当前浏览器窗口完成。"""
     global page
@@ -1198,10 +1466,17 @@ def _wait_for_turnstile(log_callback=None, cancel_callback=None, timeout=60):
     started = time.time()
     last_state = None
     last_log_at = 0.0
+    attempt_turnstile_clicks = 0
+    last_turnstile_click_at = 0.0
+    waiting_without_token_since = None
+    turnstile_reset_count = 0
+    TURNSTILE_RESET_AFTER_SEC = 25.0
+    TURNSTILE_RESET_MAX = 3
 
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
         state = _read_turnstile_state()
+        _raise_if_xai_page_error(log_callback=log_callback)
         status = state["state"]
         token = state["token"]
 
@@ -1216,8 +1491,41 @@ def _wait_for_turnstile(log_callback=None, cancel_callback=None, timeout=60):
         if status == TURNSTILE_FAILED:
             raise Exception("Cloudflare 人机验证失败")
 
+        if status == TURNSTILE_WAITING:
+            if waiting_without_token_since is None:
+                waiting_without_token_since = time.time()
+            stuck_sec = time.time() - waiting_without_token_since
+            if (
+                stuck_sec >= TURNSTILE_RESET_AFTER_SEC
+                and turnstile_reset_count < TURNSTILE_RESET_MAX
+            ):
+                turnstile_reset_count += 1
+                waiting_without_token_since = time.time()  # 重置观察窗口
+                if not _reset_turnstile_widget(log_callback):
+                    if log_callback:
+                        log_callback(f"[Debug] Turnstile 重置不可用（第 {turnstile_reset_count} 次，可能 API 未加载）")
+            if turnstile_reset_count >= TURNSTILE_RESET_MAX and not state.get("script_present"):
+                # 连 reset API 都不存在（脚本从未加载）且超过观察上限：快速失败
+                raise Exception("Turnstile 组件脚本未加载且无法重置（疑似节点质量差/被拦截），快速失败")
+        else:
+            waiting_without_token_since = None
+
         now = time.time()
         state_changed = status != last_state
+        if status == TURNSTILE_WAITING:
+            auto_click = bool(config.get("cf_turnstile_auto_click", False))
+            should_click = (
+                auto_click
+                and state.get("visible")
+                and attempt_turnstile_clicks < MAX_TURNSTILE_AUTO_CLICKS
+                and now - last_turnstile_click_at >= TURNSTILE_AUTO_CLICK_INTERVAL
+            )
+            if should_click:
+                attempt_turnstile_clicks += 1
+                last_turnstile_click_at = now
+                _attempt_turnstile_click(log_callback)
+                if log_callback:
+                    log_callback(f"[Debug] Turnstile 自动点击第 {attempt_turnstile_clicks}/{MAX_TURNSTILE_AUTO_CLICKS} 次")
         if log_callback and (state_changed or now - last_log_at >= 5):
             if status == TURNSTILE_LOADING:
                 log_callback("[*] Cloudflare 人机验证组件正在加载...")
@@ -1275,6 +1583,7 @@ def fill_profile_and_submit(timeout=120, log_callback=None, cancel_callback=None
 
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
+        _raise_if_xai_page_error(log_callback=log_callback)
         if not form_filled_once:
             filled = page.run_js(
                 """
@@ -1440,6 +1749,41 @@ return 'submitted';
 
     raise Exception("最终注册页资料填写失败")
 
+def _post_success_dwell(log_callback=None, cancel_callback=None):
+    """注册成功后模拟正常用户浏览：跳转 grok.com 等主体渲染后停留一段时间再关窗。
+
+    避免账号刚落地（sso 刚发）就瞬间关闭浏览器这种非用户行为，
+    同时让跳转链路自然完成（绕开 auth.grokusercontent.com 的锚点页）。
+    """
+    try:
+        dwell = int(config.get("post_success_dwell_sec", 15) or 0)
+    except Exception:
+        dwell = 15
+    if dwell <= 0 or page is None:
+        return
+    if log_callback:
+        log_callback(f"[*] 注册成功，模拟正常浏览（停留 {dwell}s 后关闭）…")
+    started = time.time()
+    try:
+        page.get("https://grok.com/", retry=1, interval=1, timeout=20)
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[Debug] 回到 grok.com 未完全加载（不影响账号）: {exc}")
+    try:
+        page.wait.doc_loaded(timeout=15)
+    except Exception:
+        pass
+    remaining = dwell - (time.time() - started)
+    sleeper = globals().get("sleep_with_cancel")
+    while remaining > 0:
+        chunk = min(1.0, remaining)
+        if callable(sleeper):
+            sleeper(chunk, cancel_callback)
+        else:
+            time.sleep(chunk)
+        remaining -= chunk
+
+
 def wait_for_sso_cookie(timeout=120, log_callback=None, cancel_callback=None):
     deadline = time.time() + timeout
     last_seen_names = set()
@@ -1457,6 +1801,7 @@ def wait_for_sso_cookie(timeout=120, log_callback=None, cancel_callback=None):
         raise_if_cancelled(cancel_callback)
         try:
             refresh_active_page()
+            _raise_if_xai_page_error(log_callback=log_callback)
             if page is None:
                 sleep_with_cancel(1, cancel_callback)
                 continue
@@ -1560,6 +1905,7 @@ return 'final-page-clicked-submit';
                 if name == "sso" and value:
                     if log_callback:
                         log_callback("[*] 已获取到 sso cookie")
+                    _post_success_dwell(log_callback=log_callback, cancel_callback=cancel_callback)
                     return value
             # A completed polling iteration breaks any previous exception streak.
             consecutive_wait_errors = 0
