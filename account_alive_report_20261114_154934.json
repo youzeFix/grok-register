@@ -1,0 +1,23 @@
+{
+  "summary": {
+    "total": 1,
+    "alive": 0,
+    "risk_blocked": 0,
+    "sso_invalid": 0,
+    "uncertain": 1,
+    "network_error": 0
+  },
+  "results": [
+    {
+      "email": "fangbo839369@outlook.com",
+      "account_id": 1,
+      "level": "uncertain",
+      "message": "页面未发现账号状态字段（可能改版）| url=about:blank | inner_len=0 | cookies=sso | html_head=<html><head></head><body></body></html>",
+      "checked_at": "2026-11-14T15:48:02",
+      "status_code": 0,
+      "bot_flag_source": null,
+      "policy": "",
+      "bot_flag_details": ""
+    }
+  ]
+}

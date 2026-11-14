@@ -1,0 +1,45 @@
+{
+  "summary": {
+    "total": 3,
+    "alive": 0,
+    "risk_blocked": 0,
+    "sso_invalid": 0,
+    "uncertain": 3,
+    "network_error": 0
+  },
+  "results": [
+    {
+      "email": "fangbo839369@outlook.com",
+      "account_id": 1,
+      "level": "uncertain",
+      "message": "页面未发现账号状态字段（可能改版）",
+      "checked_at": "2026-11-14T14:59:33",
+      "status_code": 0,
+      "bot_flag_source": null,
+      "policy": "",
+      "bot_flag_details": ""
+    },
+    {
+      "email": "gonggang440151@outlook.com",
+      "account_id": 3,
+      "level": "uncertain",
+      "message": "页面未发现账号状态字段（可能改版）",
+      "checked_at": "2026-11-14T15:01:52",
+      "status_code": 0,
+      "bot_flag_source": null,
+      "policy": "",
+      "bot_flag_details": ""
+    },
+    {
+      "email": "kimberlystone9721@outlook.com",
+      "account_id": 2,
+      "level": "uncertain",
+      "message": "页面未发现账号状态字段（可能改版）",
+      "checked_at": "2026-11-14T15:01:07",
+      "status_code": 0,
+      "bot_flag_source": null,
+      "policy": "",
+      "bot_flag_details": ""
+    }
+  ]
+}

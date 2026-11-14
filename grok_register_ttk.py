@@ -2121,7 +2121,102 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1].strip().lower() in ("check", "health-check"):
         connectivity = "--connectivity" in sys.argv[2:]
         raise SystemExit(0 if run_health_check_cli(connectivity) else 1)
-    if len(sys.argv) > 1 and sys.argv[1].strip().lower() == "retry-pending":
+    if len(sys.argv) > 1 and sys.argv[1].strip().lower() == "check-alive":
+        from account_alive import (
+            DEFAULT_CONCURRENCY, load_accounts_from_db, load_accounts_from_txt,
+            run_alive_check, write_report,
+        )
+        try:
+            load_config()
+        except ConfigError as exc:
+            cli_log(f"[!] {exc}")
+            return
+        args = sys.argv[2:]
+        limit = None
+        concurrency = DEFAULT_CONCURRENCY
+        use_txt = False
+        while args:
+            flag = args.pop(0)
+            if flag == "--limit":
+                limit = int(args.pop(0))
+            elif flag == "--concurrency":
+                concurrency = int(args.pop(0))
+            elif flag == "--txt":
+                use_txt = True
+        try:
+            if use_txt:
+                accounts = load_accounts_from_txt(
+                    [p for p in os.listdir(".") if p.startswith("accounts_") and p.endswith(".txt")]
+                )
+            else:
+                accounts = load_accounts_from_db()
+            if limit:
+                accounts = accounts[:limit]
+            if not accounts:
+                cli_log("[查活] 没有找到可检查的账号")
+                return
+            cli_log(f"[*] 批量查活: {len(accounts)} 个账号 | 出口: 配置代理 | 通道: 真实浏览器")
+            from account_alive import check_account_via_browser
+            _bind_registration_browser()
+            # 查活用固定常驻 profile：首次过 CF 质询后 cf_clearance 持久化，
+            # 之后不再触发质询（auto_port 每次新 profile 会反复弹质询且导航静默失败）
+            from DrissionPage import ChromiumOptions
+            from browser_runtime import _configure_browser_environment, apply_browser_proxy_option
+            _rb = _registration_browser
+            options = ChromiumOptions()
+            options.set_user_data_path(os.path.join(".DrissionPage", "aliveness_profile"))
+            options.set_timeouts(base=1)
+            _configure_browser_environment(options)
+            apply_browser_proxy_option(options, get_configured_proxy())
+            _rb.browser = _rb.Chromium(options)
+            _rb.browser_started_with_proxy = bool(get_configured_proxy())
+            tabs = _rb.browser.get_tabs()
+            _rb.page = tabs[-1] if tabs else _rb.browser.new_tab()
+            page_obj = _rb.page
+
+            def _switch_chain_node():
+                import clash_rotate
+                settings = {
+                    "clash_api_url": str(config.get("clash_api_url", "") or "").strip(),
+                    "clash_api_secret": str(config.get("clash_api_secret", "") or "").strip(),
+                    "clash_proxy_group": str(config.get("clash_proxy_group", "") or "").strip(),
+                    "clash_rotate_nodes": str(config.get("clash_rotate_nodes", "") or "").strip(),
+                }
+                if os.environ.get("CHECK_ALIVE_DEBUG"):
+                    cli_log("[Debug] 切换节点 settings: %s" % {k: (v[:28] + "…" if k == "clash_api_url" else v) for k, v in settings.items()})
+                import clash_rotate as _cr
+                status, node = _cr.emergency_switch(settings, log_callback=cli_log)
+                if not node:
+                    cli_log("[!] 链路一级候选全部不通，稍后原样重试")
+                return node
+
+            try:
+                payload = run_alive_check(
+                    accounts,
+                    user_agent=str(config.get("user_agent") or ""),
+                    concurrency=1,
+                    delay_range=(1.0, 3.0),
+                    log_callback=cli_log,
+                    browser_page=page_obj,
+                    challenge_helper=lambda: _registration_browser._attempt_turnstile_click(),
+                    node_switch_helper=lambda: _switch_chain_node(),
+                )
+            finally:
+                try:
+                    _rb.stop_browser()
+                except Exception:
+                    pass
+            report_path = write_report(payload)
+            summary = payload["summary"]
+            cli_log(
+                f"[*] 查活完成: 存活 {summary['alive']} | 风控封禁 {summary['risk_blocked']} | "
+                f"sso失效 {summary['sso_invalid']} | 待定 {summary['uncertain']} | 网络失败 {summary['network_error']}"
+            )
+            cli_log(f"[*] 报告已写入: {report_path}（SQLite accounts.authorization_status 已同步更新）")
+        except Exception as exc:
+            log_exception("查活失败", exc, cli_log)
+        return
+    if len(sys.argv) > 1 and len(sys.argv[1]) >= 2 and sys.argv[1].strip().lower() == "retry-pending":
         if len(sys.argv) < 3:
             print("用法: python grok_register_ttk.py retry-pending <pending文件> [输出文件]", file=sys.stderr)
             return

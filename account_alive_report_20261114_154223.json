@@ -1,0 +1,23 @@
+{
+  "summary": {
+    "total": 1,
+    "alive": 0,
+    "risk_blocked": 0,
+    "sso_invalid": 0,
+    "uncertain": 1,
+    "network_error": 0
+  },
+  "results": [
+    {
+      "email": "fangbo839369@outlook.com",
+      "account_id": 1,
+      "level": "uncertain",
+      "message": "页面未发现账号状态字段（可能改版）| url=https://grok.com/ | inner_len=0 | cookies=sso | html_head=<!DOCTYPE html><html dir=\"ltr\" lang=\"en\" class=\"focus-outline-visible\" lazy-loaded=\"true\"><head>     <meta charset=\"utf-8\">     <title>New Tab</title>     <style>       body {     ",
+      "checked_at": "2026-11-14T15:40:50",
+      "status_code": 0,
+      "bot_flag_source": null,
+      "policy": "",
+      "bot_flag_details": ""
+    }
+  ]
+}

@@ -1,0 +1,34 @@
+{
+  "summary": {
+    "total": 2,
+    "alive": 0,
+    "risk_blocked": 0,
+    "sso_invalid": 0,
+    "uncertain": 0,
+    "network_error": 2
+  },
+  "results": [
+    {
+      "email": "fangbo839369@outlook.com",
+      "account_id": 1,
+      "level": "network_error",
+      "message": "grok.com 打开失败（一级出口连续不可达，已尝试换节点）",
+      "checked_at": "2026-11-14T16:13:42",
+      "status_code": 0,
+      "bot_flag_source": null,
+      "policy": "",
+      "bot_flag_details": ""
+    },
+    {
+      "email": "kimberlystone9721@outlook.com",
+      "account_id": 2,
+      "level": "network_error",
+      "message": "grok.com 打开失败（一级出口连续不可达，已尝试换节点）",
+      "checked_at": "2026-11-14T16:18:16",
+      "status_code": 0,
+      "bot_flag_source": null,
+      "policy": "",
+      "bot_flag_details": ""
+    }
+  ]
+}

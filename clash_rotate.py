@@ -36,7 +36,68 @@ def _desktop_headers(secret):
 
 def _request(url, secret, method="GET", payload=None, timeout=6):
     body = json.dumps(payload).encode("utf-8") if payload is not None else None
-    request = urllib.request.Request(url, data=body, headers=_desktop_headers(secret), method=method)
+    headers = _desktop_headers(secret)
+    if url.startswith("unix://"):
+        # unix:///path/to/verge-mihomo.sock/v1/... —— Clash Verge Rev 的官方控制通道
+        # （新版客户端默认只开 unix socket，TCP external-controller 可能被移除）
+        import socket as _socket
+        rest = url[len("unix://"):]  # /run/.../verge-mihomo.sock/proxies
+        end = rest.find(".sock")
+        if end > 0:
+            end += len(".sock")
+            sock_path, path = rest[:end], rest[end:] or "/"
+        else:
+            sock_path, path = rest, "/"
+        sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        sock.connect(sock_path)
+        try:
+            payload_bytes = body or b""
+            head_lines = [
+                "%s %s HTTP/1.1" % (method, path),
+                "Host: localhost",
+                "Content-Length: %d" % len(payload_bytes),
+                "Connection: close",
+            ]
+            head_lines.extend("%s: %s" % item for item in headers.items())
+            request_text = "\r\n".join(head_lines) + "\r\n\r\n"
+            sock.sendall(request_text.encode("latin1") + payload_bytes)
+            chunks = []
+            while True:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            raw = b"".join(chunks)
+        finally:
+            sock.close()
+        if b"\r\n\r\n" not in raw:
+            raise ClashRotateError("unix-socket API 无响应")
+        head, _, payload_out = raw.partition(b"\r\n\r\n")
+        status_line = head.split(b"\r\n", 1)[0].decode("latin1", "ignore")
+        status = int(status_line.split()[1]) if len(status_line.split()) > 1 else 0
+        # 处理 Transfer-Encoding: chunked（mihomo 对大响应默认分块）
+        if b"chunked" in head.lower():
+            decoded = b""
+            cursor = 0
+            while cursor < len(payload_out):
+                line_end = payload_out.find(b"\r\n", cursor)
+                if line_end < 0:
+                    break
+                try:
+                    size = int(payload_out[cursor:line_end].split(b";")[0], 16)
+                except ValueError:
+                    break
+                if size == 0:
+                    break
+                decoded += payload_out[line_end + 2: line_end + 2 + size]
+                cursor = line_end + 2 + size + 2
+            payload_out = decoded
+        parsed = json.loads((payload_out or b"{}").decode("utf-8") or "{}")
+        if status in (200, 204):
+            return parsed
+        raise ClashRotateError("unix-socket API HTTP %s: %s" % (status, str(parsed)[:120]))
+    request = urllib.request.Request(url, data=body, headers=headers, method=method)
     with urllib.request.urlopen(request, timeout=timeout) as resp:
         return json.loads((resp.read() or b"{}").decode("utf-8") or "{}")
 
